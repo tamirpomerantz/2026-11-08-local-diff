@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Klein Local</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Instrument+Sans:ital,wght@0,400;0,500;1,400&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/canvas.css" />
+  </head>
+  <body>
+    <main class="stage" id="stage">
+      <div id="canvas-root"></div>
+    </main>
+
+    <aside class="board edge-panel" id="board-panel" aria-hidden="true" aria-label="Generate">
+      <div class="board-frost edge-frost" aria-hidden="true"></div>
+      <div class="edge-track" id="board-track">
+        <div class="edge-content" id="board-content">
+      <div class="describe-stack" id="describe-stack">
+        <section class="describe" id="describe-subject" data-part="subject" data-state="idle">
+          <div class="describe-fill" aria-hidden="true"></div>
+          <img class="describe-meal" alt="" hidden />
+          <p class="describe-status">describing…</p>
+          <div
+            id="prompt-subject"
+            class="prompt"
+            contenteditable="true"
+            role="textbox"
+            aria-multiline="true"
+            aria-label="Subject"
+            data-placeholder="Subject and pose…"
+          ></div>
+        </section>
+        <section class="describe" id="describe-style" data-part="style" data-state="idle">
+          <div class="describe-fill" aria-hidden="true"></div>
+          <img class="describe-meal" alt="" hidden />
+          <p class="describe-status">describing…</p>
+          <div
+            id="prompt-style"
+            class="prompt"
+            contenteditable="true"
+            role="textbox"
+            aria-multiline="true"
+            aria-label="Style"
+            data-placeholder="Style and photograph…"
+          ></div>
+        </section>
+      </div>
+      <div class="sr-only">
+        <span id="status-pill" class="live-dot" aria-label="checking"></span>
+        <p id="status" aria-live="polite"></p>
+        <p id="error" aria-live="assertive" hidden></p>
+      </div>
+
+      <section class="strip">
+        <div id="slots" class="slots"></div>
+        <button type="button" id="sampler-btn" class="sampler-btn" aria-haspopup="listbox" aria-expanded="false">
+          <span id="sampler-label">DDIM Trailing</span>
+          <i data-lucide="chevron-down"></i>
+        </button>
+        <div class="strip-play" id="strip-play">
+          <div class="steps" role="radiogroup" aria-label="Steps">
+            <label title="2 steps">
+              <input type="radio" name="steps" value="2" aria-label="2 steps" />
+              <i data-lucide="pencil"></i>
+            </label>
+            <label title="4 steps">
+              <input type="radio" name="steps" value="4" checked aria-label="4 steps" />
+              <i data-lucide="pen"></i>
+            </label>
+          </div>
+          <button type="button" id="generate-btn" class="icon-btn" aria-label="Generate">
+            <i data-lucide="play"></i>
+          </button>
+        </div>
+      </section>
+        </div>
+      </div>
+    </aside>
+
+    <div id="ratio-menu" class="ratio-menu" hidden></div>
+    <div id="sampler-menu" class="sampler-menu" hidden></div>
+    <div id="image-menu" class="image-menu" hidden></div>
+    <div id="drag-lift-layer" class="drag-lift-layer" hidden></div>
+    <script src="/vendor/lucide.min.js"></script>
+    <script src="/canvas.js" type="module"></script>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

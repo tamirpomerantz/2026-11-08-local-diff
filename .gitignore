@@ -1,0 +1,13 @@
+node_modules
+public/canvas.js
+public/canvas.css
+public/canvas.js.map
+.venv
+.hf-cache
+python/__pycache__
+*.pyc
+generated/*.png
+generated/*.json
+.env
+.DS_Store
+klein-debug.log
