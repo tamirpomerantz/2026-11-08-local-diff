@@ -3,7 +3,7 @@ import * as esbuild from "esbuild";
 import { spawn, execFile } from "child_process";
 import { watch } from "node:fs";
 import readline from "node:readline";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import os from "node:os";
 import fs from "fs/promises";
@@ -23,7 +23,34 @@ const HF_HOME = process.env.HF_HOME ?? path.join(__dirname, ".hf-cache");
 
 const MODEL = process.env.DRAWTHINGS_MODEL ?? "flux_2_klein_4b_q8p.ckpt";
 const FAL_VISION_URL = "https://fal.run/fal-ai/any-llm/vision";
+const FAL_LLM_URL = "https://fal.run/fal-ai/any-llm";
 const FAL_DESCRIBE_MODEL = process.env.FAL_DESCRIBE_MODEL ?? "openai/gpt-5-mini";
+const REVISE_SYSTEM_PROMPT =
+  "You rewrite text-to-image prompts. Apply the user's change to the original subject and style. " +
+  "Keep everything that is not changed. Subject is who or what is depicted and how they are posed. " +
+  "Style is medium, palette, light, and mood only. Preserve {random} and {random_color} tokens if they still apply. " +
+  'Reply with JSON only: {"subject":"...","style":"..."}';
+const SHUFFLE_SYSTEM_PROMPT =
+  "You rewrite text-to-image prompts. Invent ONE interesting change with no user direction. " +
+  "Choose freely among proportion, color, size, adding something, removing something, a pose shift, a new object, or another surprising twist. " +
+  "Keep the scene recognizable. Do not merely rephrase. Do not explain the change. " +
+  "Subject is who or what is depicted and how they are posed. Style is medium, palette, light, and mood only. " +
+  "Preserve {random} and {random_color} tokens if they still apply. " +
+  'Reply with JSON only: {"subject":"...","style":"..."}';
+const CLOSEUP_SYSTEM_PROMPT =
+  "You rewrite text-to-image prompts as a close-up of the original scene. " +
+  "Move in much closer on the main subject so it fills the frame. Describe the crop: what is now visible, what is cut off, scale, and how the subject sits in the shot. " +
+  "Keep identity and style. Do not pull back to a wide shot. Do not merely prepend close-up of. Do not mention camera bodies or focal lengths. " +
+  "Subject is who or what is depicted and how they are posed. Style is medium, palette, light, and mood only. " +
+  "Preserve {random} and {random_color} tokens if they still apply. " +
+  'Reply with JSON only: {"subject":"...","style":"..."}';
+const TWIN_SYSTEM_PROMPT =
+  "You rewrite text-to-image prompts using different words for the same scene. " +
+  "Keep the subject, pose, setting, and style. Swap phrasing, synonyms, and sentence shape so it is not a copy. " +
+  "Do not add new objects, remove things, or change colors, scale, or camera distance. " +
+  "Subject is who or what is depicted and how they are posed. Style is medium, palette, light, and mood only. " +
+  "Preserve {random} and {random_color} tokens if they still apply. " +
+  'Reply with JSON only: {"subject":"...","style":"..."}';
 const DESCRIBE_SUBJECT_PROMPT =
   "Write a dense text-to-image prompt for ONLY the subject and positioning, at least 25 words. " +
   "Include who or what is depicted, pose, gesture, scale, placement in the frame, and spatial arrangement. " +
@@ -39,6 +66,27 @@ const DESCRIBE_STYLE_PROMPT =
   "Do not mention camera bodies, focal length, aperture, film stock names, or technique catalogs. " +
   "Do not name or describe the subject, people, objects, or poses. " +
   "Do not call it a screenshot or an image. Output only the style brief.";
+const COMBINE_MAX_IMAGES = 4;
+const COMBINE_SUBJECT_PROMPT =
+  "These pictures are references for ONE new image. Write a dense text-to-image prompt for ONLY the combined subject and positioning, at least 25 words. " +
+  "Fuse who or what appears in ALL of them into a single original scene — one arrangement, not a catalog. " +
+  "Invent a unique combination of the topics, people, objects, and poses rather than listing each picture. " +
+  "Include pose, gesture, scale, placement in the frame, and spatial arrangement of the fused scene. " +
+  "Do not mention style, lighting, materials, colors, camera, medium, or mood. " +
+  "Do not mention that these are photos, screenshots, or multiple images. Do not say combined or number the pictures. " +
+  "Output only the prompt.";
+const COMBINE_STYLE_PROMPT =
+  "These pictures are references for the LOOK of ONE new image. You are writing the ONLY style instructions another image model will receive. " +
+  "Invent one original hybrid style by mixing the medium, treatment, palette, light, and mood from ALL of them. Do not list each picture's look separately. " +
+  "In 1 or 2 short sentences (about 20 to 40 words), tell it the medium and how it should feel, not what is in the picture. " +
+  "Start by naming the fused medium in plain words: photograph, oil painting, watercolor, ink drawing, 3D render, digital illustration, analog snapshot, or whatever the mix becomes. " +
+  "Then name the genre or treatment (cinematic, editorial, studio still life, documentary, painterly, etc.). " +
+  "Describe the ambience and atmosphere. Name 3 to 5 specific colors drawn from the mix. Mention lighting quality in a few words. " +
+  "Write it as a brief to the model, in prose, not a keyword list and not labeled fields. " +
+  "Do not mention camera bodies, focal length, aperture, film stock names, or technique catalogs. " +
+  "Do not name or describe the subject, people, objects, or poses. " +
+  "Do not call it a screenshot or an image. Do not mention that there were several pictures. " +
+  "Output only the style brief.";
 const SHORT_SIDE = 128;
 const ENLARGE_SHORT_SIDE = 1024;
 const ENLARGE_STRENGTH = 0.3;
@@ -323,9 +371,84 @@ async function imageToFalDataUrl(filePath) {
   return bufferToFalJpegDataUrl(buf, path.extname(filePath).toLowerCase() || ".png");
 }
 
-async function falVision(imageUrl, prompt) {
+async function falText(prompt, systemPrompt = REVISE_SYSTEM_PROMPT, { temperature = 0.4 } = {}) {
+  const key = falKey();
+  if (!key) throw new Error("Missing FALKEY. Add it to .env to revise prompts.");
+  const response = await fetch(FAL_LLM_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Key ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      prompt,
+      system_prompt: systemPrompt,
+      model: FAL_DESCRIBE_MODEL,
+      reasoning: true,
+      priority: "latency",
+      temperature,
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(falErrorMessage(payload, response.status));
+  const data = payload?.data ?? payload;
+  const text = cleanDescribeText(data?.output);
+  if (!text) throw new Error("fal returned an empty prompt.");
+  return text;
+}
+
+function parseRevisedPrompt(text) {
+  const cleaned = cleanDescribeText(text);
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    try {
+      const parsed = JSON.parse(cleaned.slice(start, end + 1));
+      const subject = String(parsed.subject ?? parsed.prompt ?? "").trim();
+      const style = String(parsed.style ?? "").trim();
+      if (subject || style) return { subject, style };
+    } catch {
+      // Fall through to plain text.
+    }
+  }
+  if (cleaned) return { subject: cleaned, style: "" };
+  throw new Error("The model returned an empty prompt.");
+}
+
+async function originalPromptForRevise(filename, subject, style) {
+  let nextSubject = String(subject ?? "").trim();
+  let nextStyle = String(style ?? "").trim();
+  if (filename) {
+    if (!nextSubject) nextSubject = await rememberedPart(filename, "subject");
+    if (!nextStyle) nextStyle = await rememberedPart(filename, "style");
+  }
+  const filePath = resolveExistingFile(filename);
+  const missing = [];
+  if (!nextSubject) missing.push("subject");
+  if (!nextStyle) missing.push("style");
+  if (missing.length && filePath) {
+    const described = await Promise.all(
+      missing.map((part) => describeWithFal({ filePath, part })),
+    );
+    for (const part of described) {
+      if (part.subject) nextSubject = part.subject;
+      if (part.style) nextStyle = part.style;
+    }
+    if (filename && (nextSubject || nextStyle)) {
+      await rememberImageDescription(filename, { subject: nextSubject, style: nextStyle });
+    }
+  }
+  if (!nextSubject && !nextStyle) {
+    throw new Error("This image has no prompt to revise.");
+  }
+  return { subject: nextSubject, style: nextStyle };
+}
+
+async function falVision(imageUrls, prompt, { temperature = 0.3 } = {}) {
   const key = falKey();
   if (!key) throw new Error("Missing FALKEY. Add it to .env to describe images.");
+  const urls = (Array.isArray(imageUrls) ? imageUrls : [imageUrls]).filter(Boolean);
+  if (!urls.length) throw new Error("Drop an image onto the prompt to describe it.");
   const response = await fetch(FAL_VISION_URL, {
     method: "POST",
     headers: {
@@ -335,11 +458,11 @@ async function falVision(imageUrl, prompt) {
     body: JSON.stringify({
       prompt,
       system_prompt: "Output only the image prompt. No preface, quotes, or markdown.",
-      image_urls: [imageUrl],
+      image_urls: urls,
       model: FAL_DESCRIBE_MODEL,
       reasoning: true,
       priority: "latency",
-      temperature: 0.3,
+      temperature,
     }),
   });
   const payload = await response.json().catch(() => ({}));
@@ -350,19 +473,35 @@ async function falVision(imageUrl, prompt) {
   return text;
 }
 
-async function describeWithFal({ filePath, dataUrl, part }) {
-  const task = part === "style" ? "style" : "subject";
-  let imageUrl;
+async function falImageUrlFromSource({ filePath, dataUrl }) {
   if (dataUrl) {
     const parsed = parseImageDataUrl(dataUrl);
     if (!parsed) throw new Error("Could not read dropped image.");
-    imageUrl = await bufferToFalJpegDataUrl(parsed.buf, parsed.ext);
-  } else {
-    imageUrl = await imageToFalDataUrl(filePath);
+    return bufferToFalJpegDataUrl(parsed.buf, parsed.ext);
   }
+  if (filePath) return imageToFalDataUrl(filePath);
+  throw new Error("Drop an image onto the prompt to describe it.");
+}
+
+async function describeWithFal({ filePath, dataUrl, images, part }) {
+  const task = part === "style" ? "style" : "subject";
+  const sources =
+    Array.isArray(images) && images.length ? images.slice(0, COMBINE_MAX_IMAGES) : [{ filePath, dataUrl }];
+  const imageUrls = [];
+  for (const source of sources) {
+    imageUrls.push(await falImageUrlFromSource(source));
+  }
+  const combine = imageUrls.length > 1;
   const text = await falVision(
-    imageUrl,
-    task === "style" ? DESCRIBE_STYLE_PROMPT : DESCRIBE_SUBJECT_PROMPT,
+    imageUrls,
+    combine
+      ? task === "style"
+        ? COMBINE_STYLE_PROMPT
+        : COMBINE_SUBJECT_PROMPT
+      : task === "style"
+        ? DESCRIBE_STYLE_PROMPT
+        : DESCRIBE_SUBJECT_PROMPT,
+    { temperature: combine ? 0.55 : 0.3 },
   );
   return { [task]: text };
 }
@@ -405,6 +544,170 @@ function descriptionParts(entry) {
 
 function combinePrompt(subject, style) {
   return [subject, style].map((part) => String(part ?? "").trim()).filter(Boolean).join("\n\n");
+}
+
+const PROMPT_TOKEN_RE = /\{random_color\}|\{random\}/gi;
+const RANDOM_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const HTML_COLOR_NAMES = [
+  "alice blue",
+  "antique white",
+  "aqua",
+  "aquamarine",
+  "azure",
+  "beige",
+  "bisque",
+  "black",
+  "blanched almond",
+  "blue",
+  "blue violet",
+  "brown",
+  "burlywood",
+  "cadet blue",
+  "chartreuse",
+  "chocolate",
+  "coral",
+  "cornflower blue",
+  "cornsilk",
+  "crimson",
+  "cyan",
+  "dark blue",
+  "dark cyan",
+  "dark goldenrod",
+  "dark gray",
+  "dark green",
+  "dark khaki",
+  "dark magenta",
+  "dark olive green",
+  "dark orange",
+  "dark orchid",
+  "dark red",
+  "dark salmon",
+  "dark sea green",
+  "dark slate blue",
+  "dark slate gray",
+  "dark turquoise",
+  "dark violet",
+  "deep pink",
+  "deep sky blue",
+  "dim gray",
+  "dodger blue",
+  "firebrick",
+  "floral white",
+  "forest green",
+  "fuchsia",
+  "gainsboro",
+  "ghost white",
+  "gold",
+  "goldenrod",
+  "gray",
+  "green",
+  "green yellow",
+  "honeydew",
+  "hot pink",
+  "indian red",
+  "indigo",
+  "ivory",
+  "khaki",
+  "lavender",
+  "lavender blush",
+  "lawn green",
+  "lemon chiffon",
+  "light blue",
+  "light coral",
+  "light cyan",
+  "light goldenrod yellow",
+  "light gray",
+  "light green",
+  "light pink",
+  "light salmon",
+  "light sea green",
+  "light sky blue",
+  "light slate gray",
+  "light steel blue",
+  "light yellow",
+  "lime",
+  "lime green",
+  "linen",
+  "magenta",
+  "maroon",
+  "medium aquamarine",
+  "medium blue",
+  "medium orchid",
+  "medium purple",
+  "medium sea green",
+  "medium slate blue",
+  "medium spring green",
+  "medium turquoise",
+  "medium violet red",
+  "midnight blue",
+  "mint cream",
+  "misty rose",
+  "moccasin",
+  "navajo white",
+  "navy",
+  "old lace",
+  "olive",
+  "olive drab",
+  "orange",
+  "orange red",
+  "orchid",
+  "pale goldenrod",
+  "pale green",
+  "pale turquoise",
+  "pale violet red",
+  "papaya whip",
+  "peach puff",
+  "peru",
+  "pink",
+  "plum",
+  "powder blue",
+  "purple",
+  "rebecca purple",
+  "red",
+  "rosy brown",
+  "royal blue",
+  "saddle brown",
+  "salmon",
+  "sandy brown",
+  "sea green",
+  "seashell",
+  "sienna",
+  "silver",
+  "sky blue",
+  "slate blue",
+  "slate gray",
+  "snow",
+  "spring green",
+  "steel blue",
+  "tan",
+  "teal",
+  "thistle",
+  "tomato",
+  "turquoise",
+  "violet",
+  "wheat",
+  "white",
+  "white smoke",
+  "yellow",
+  "yellow green",
+];
+
+function randomTokenValue(length = 5) {
+  const bytes = randomBytes(length);
+  let out = "";
+  for (const byte of bytes) out += RANDOM_ALPHABET[byte % RANDOM_ALPHABET.length];
+  return out;
+}
+
+function randomHtmlColorName() {
+  const index = randomBytes(2).readUInt16BE(0) % HTML_COLOR_NAMES.length;
+  return HTML_COLOR_NAMES[index];
+}
+
+function expandRandomTokens(text) {
+  return String(text ?? "").replace(PROMPT_TOKEN_RE, (token) =>
+    token.toLowerCase() === "{random_color}" ? randomHtmlColorName() : randomTokenValue(),
+  );
 }
 
 async function rememberedPart(filename, part) {
@@ -472,6 +775,27 @@ function timestamp() {
   ].join("");
 }
 
+function cancelledError() {
+  return Object.assign(new Error("Generation cancelled."), { cancelled: true });
+}
+
+function killChild(child) {
+  if (!child || child.killed || child.exitCode != null) return;
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    // Process may already be gone.
+  }
+  setTimeout(() => {
+    if (child.killed || child.exitCode != null) return;
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Process may already be gone.
+    }
+  }, 1200);
+}
+
 function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -480,6 +804,15 @@ function runCommand(command, args, options = {}) {
     });
     let stdout = "";
     let stderr = "";
+    const onAbort = () => {
+      killChild(child);
+      reject(cancelledError());
+    };
+    if (options.signal?.aborted) {
+      onAbort();
+      return;
+    }
+    options.signal?.addEventListener("abort", onAbort, { once: true });
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
     });
@@ -488,6 +821,11 @@ function runCommand(command, args, options = {}) {
     });
     child.on("error", reject);
     child.on("close", (code) => {
+      options.signal?.removeEventListener("abort", onAbort);
+      if (options.signal?.aborted) {
+        reject(cancelledError());
+        return;
+      }
       if (code === 0) resolve({ stdout, stderr });
       else {
         const error = new Error((stderr || stdout).trim() || `${command} exited ${code}`);
@@ -582,7 +920,7 @@ function consumeITermImages(state, chunk, onPng) {
   }
 }
 
-function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onProgress }) {
+function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onProgress, signal }) {
   const previewArgs = [
     ...args,
     "--terminal-image",
@@ -591,6 +929,7 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
     "--no-download-missing",
   ];
   const fallbackArgs = [...args, "--output", outputPath, "--disable-preview", "--no-download-missing"];
+  if (signal?.aborted) return Promise.reject(cancelledError());
 
   const runWithPty = () =>
     new Promise((resolve, reject) => {
@@ -610,6 +949,9 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
       let stderr = "";
       let frames = 0;
       let writing = Promise.resolve();
+      const onAbort = () => killChild(child);
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener("abort", onAbort, { once: true });
       const handleBytes = (chunk) => {
         const text = chunk.toString("utf8");
         stdout += text;
@@ -630,7 +972,12 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
       });
       child.on("error", reject);
       child.on("close", async (code) => {
+        signal?.removeEventListener("abort", onAbort);
         await writing.catch(() => {});
+        if (signal?.aborted) {
+          reject(cancelledError());
+          return;
+        }
         if (code === 0 && frames > 0) {
           await fs.copyFile(previewPath, outputPath);
           resolve({ stdout, stderr, frames });
@@ -641,8 +988,9 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
     });
 
   return runWithPty().catch(async (error) => {
+    if (error.cancelled || signal?.aborted) throw error.cancelled ? error : cancelledError();
     if (error.frames > 0) throw error;
-    await runCommand("draw-things-cli", fallbackArgs);
+    await runCommand("draw-things-cli", fallbackArgs, { signal });
     return { frames: 0, fallback: true };
   });
 }
@@ -1067,45 +1415,165 @@ app.post("/api/import", async (req, res) => {
   }
 });
 
-app.post("/api/describe", async (req, res) => {
-  const dataUrl = String(req.body?.image ?? "").trim();
+function falDataUrlFromParsed(parsed) {
+  return `data:image/${parsed.ext === ".jpg" ? "jpeg" : parsed.ext.slice(1)};base64,${parsed.buf.toString("base64")}`;
+}
+
+function describeItemFromBody(item) {
+  const dataUrl = String(item?.image ?? item?.dataUrl ?? "").trim();
   const parsed = dataUrl ? parseImageDataUrl(dataUrl) : null;
-  const filePath = resolveExistingFile(req.body?.filename);
-  if (!parsed && !filePath) {
+  const filePath = resolveExistingFile(item?.filename);
+  if (!parsed && !filePath) return null;
+  return {
+    filename: filePath ? path.basename(filePath) : "",
+    filePath,
+    parsed,
+  };
+}
+
+function describeItemsFromBody(body) {
+  const raw = Array.isArray(body?.images) ? body.images.slice(0, COMBINE_MAX_IMAGES) : [body];
+  return raw.map(describeItemFromBody).filter(Boolean);
+}
+
+app.post("/api/describe", async (req, res) => {
+  const items = describeItemsFromBody(req.body);
+  if (!items.length) {
     res.status(400).json({ error: "Drop an image onto the prompt to describe it." });
     return;
   }
+  const part = req.body?.part === "style" ? "style" : "subject";
+  const combine = items.length > 1;
   try {
-    const filename = filePath ? path.basename(filePath) : "";
-    const part = req.body?.part === "style" ? "style" : "subject";
-    const stored = filename ? await rememberedPart(filename, part) : "";
-    if (stored) {
-      res.json({ [part]: stored, model: FAL_DESCRIBE_MODEL, cached: true });
+    if (!combine) {
+      const item = items[0];
+      const stored = item.filename ? await rememberedPart(item.filename, part) : "";
+      if (stored) {
+        res.json({ [part]: stored, model: FAL_DESCRIBE_MODEL, cached: true });
+        return;
+      }
+      if (item.filePath) await fs.access(item.filePath);
+      const described = await describeWithFal({
+        ...(item.parsed ? { dataUrl: falDataUrlFromParsed(item.parsed) } : { filePath: item.filePath }),
+        part,
+      });
+      if (item.filename) await rememberImageDescription(item.filename, described);
+      res.json({ ...described, model: FAL_DESCRIBE_MODEL });
       return;
     }
-    if (filePath) await fs.access(filePath);
     const described = await describeWithFal({
-      ...(parsed
-        ? { dataUrl: `data:image/${parsed.ext === ".jpg" ? "jpeg" : parsed.ext.slice(1)};base64,${parsed.buf.toString("base64")}` }
-        : { filePath }),
+      images: items.map((item) =>
+        item.parsed ? { dataUrl: falDataUrlFromParsed(item.parsed) } : { filePath: item.filePath },
+      ),
       part,
     });
-    if (filename) await rememberImageDescription(filename, described);
-    res.json({ ...described, model: FAL_DESCRIBE_MODEL });
+    res.json({ ...described, model: FAL_DESCRIBE_MODEL, combined: items.length });
   } catch (error) {
     res.status(500).json({ error: publicError(error) });
   }
 });
+
+app.post("/api/revise", async (req, res) => {
+  const change = String(req.body?.change ?? "").trim();
+  if (!change) {
+    res.status(400).json({ error: "Add a change, like “make it red”." });
+    return;
+  }
+  try {
+    const original = await originalPromptForRevise(
+      req.body?.filename,
+      req.body?.subject,
+      req.body?.style,
+    );
+    const output = await falText(
+      [
+        "Original subject:",
+        original.subject || "(none)",
+        "",
+        "Original style:",
+        original.style || "(none)",
+        "",
+        "Change:",
+        change,
+      ].join("\n"),
+    );
+    const revised = parseRevisedPrompt(output);
+    res.json({ ...revised, model: FAL_DESCRIBE_MODEL });
+  } catch (error) {
+    res.status(500).json({ error: publicError(error) });
+  }
+});
+
+async function rewritePromptFromRequest(req, { systemPrompt, instruction, temperature }) {
+  const original = await originalPromptForRevise(
+    req.body?.filename,
+    req.body?.subject,
+    req.body?.style,
+  );
+  const output = await falText(
+    [
+      "Original subject:",
+      original.subject || "(none)",
+      "",
+      "Original style:",
+      original.style || "(none)",
+      "",
+      instruction,
+    ].join("\n"),
+    systemPrompt,
+    { temperature },
+  );
+  return parseRevisedPrompt(output);
+}
+
+function promptRewriteRoute(options) {
+  return async (req, res) => {
+    try {
+      const rewritten = await rewritePromptFromRequest(req, options);
+      res.json({ ...rewritten, model: FAL_DESCRIBE_MODEL });
+    } catch (error) {
+      res.status(500).json({ error: publicError(error) });
+    }
+  };
+}
+
+app.post(
+  "/api/shuffle",
+  promptRewriteRoute({
+    systemPrompt: SHUFFLE_SYSTEM_PROMPT,
+    instruction: "Invent one interesting change.",
+    temperature: 0.85,
+  }),
+);
+
+app.post(
+  "/api/closeup",
+  promptRewriteRoute({
+    systemPrompt: CLOSEUP_SYSTEM_PROMPT,
+    instruction: "Rewrite as a close-up shot of this scene.",
+    temperature: 0.5,
+  }),
+);
+
+app.post(
+  "/api/twin",
+  promptRewriteRoute({
+    systemPrompt: TWIN_SYSTEM_PROMPT,
+    instruction: "Rewrite with different words. Keep the same scene.",
+    temperature: 0.7,
+  }),
+);
 
 app.post("/api/generate", async (req, res) => {
   const subject = String(req.body?.subject ?? "").trim();
   const style = String(req.body?.style ?? "").trim();
   const mode = String(req.body?.mode ?? "");
   const initPath = mode === "enlarge" ? resolveExistingFile(req.body?.image) : null;
-  const prompt =
+  const prompt = expandRandomTokens(
     combinePrompt(subject, style) ||
-    String(req.body?.prompt ?? "").trim() ||
-    (initPath ? ENLARGE_PROMPT : "");
+      String(req.body?.prompt ?? "").trim() ||
+      (initPath ? ENLARGE_PROMPT : ""),
+  );
   const aspect = String(req.body?.aspect ?? "1:1");
   const ratio = findRatio(aspect);
   if (!prompt) {
@@ -1158,7 +1626,12 @@ app.post("/api/generate", async (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders?.();
+  const abort = new AbortController();
+  res.on("close", () => {
+    if (!res.writableEnded) abort.abort();
+  });
   const send = (event) => {
+    if (res.writableEnded) return;
     res.write(`data: ${JSON.stringify(event)}\n\n`);
   };
 
@@ -1216,7 +1689,10 @@ app.post("/api/generate", async (req, res) => {
           kleinLoaded: true,
         });
       },
+      signal: abort.signal,
     });
+
+    if (abort.signal.aborted) throw cancelledError();
 
     const entry = {
       filename,
@@ -1249,8 +1725,14 @@ app.post("/api/generate", async (req, res) => {
     });
     res.end();
   } catch (error) {
-    send({ type: "error", error: publicError(error) });
-    res.end();
+    await fs.unlink(outputPath).catch(() => {});
+    if (!res.writableEnded) {
+      send({
+        type: "error",
+        error: error?.cancelled || abort.signal.aborted ? "Generation cancelled." : publicError(error),
+      });
+      res.end();
+    }
   } finally {
     busy = false;
     await fs.unlink(promptPath).catch(() => {});

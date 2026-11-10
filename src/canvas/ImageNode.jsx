@@ -21,12 +21,12 @@ export function ImageNode({ id, data, selected }) {
         ) : generating ? (
           <span className="canvas-image-aspect">{image?.aspect || ""}</span>
         ) : null}
-        {generating || exiting ? null : (
+        {exiting ? null : (
           <button
             type="button"
             className="canvas-image-delete nodrag nopan"
-            aria-label="Delete image"
-            title="Delete from folder"
+            aria-label={generating ? "Cancel generation" : "Delete image"}
+            title={generating ? "Cancel generation" : "Delete from folder"}
             onClick={(event) => {
               event.stopPropagation();
               deleteElements({ nodes: [{ id }] });

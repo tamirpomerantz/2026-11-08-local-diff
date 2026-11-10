@@ -25,7 +25,7 @@
       <div class="describe-stack" id="describe-stack">
         <section class="describe" id="describe-subject" data-part="subject" data-state="idle">
           <div class="describe-fill" aria-hidden="true"></div>
-          <img class="describe-meal" alt="" hidden />
+          <div class="describe-meals" hidden></div>
           <p class="describe-status">describing…</p>
           <div
             id="prompt-subject"
@@ -39,7 +39,7 @@
         </section>
         <section class="describe" id="describe-style" data-part="style" data-state="idle">
           <div class="describe-fill" aria-hidden="true"></div>
-          <img class="describe-meal" alt="" hidden />
+          <div class="describe-meals" hidden></div>
           <p class="describe-status">describing…</p>
           <div
             id="prompt-style"
@@ -87,6 +87,21 @@
     <div id="ratio-menu" class="ratio-menu" hidden></div>
     <div id="sampler-menu" class="sampler-menu" hidden></div>
     <div id="image-menu" class="image-menu" hidden></div>
+    <div id="prompt-edit" class="prompt-edit" hidden>
+      <form id="prompt-edit-form">
+        <input
+          id="prompt-edit-input"
+          type="text"
+          autocomplete="off"
+          spellcheck="true"
+          aria-label="Prompt change"
+          placeholder="make it red…"
+        />
+        <button type="submit" class="prompt-edit-go" aria-label="Apply prompt">
+          <i data-lucide="play"></i>
+        </button>
+      </form>
+    </div>
     <div id="drag-lift-layer" class="drag-lift-layer" hidden></div>
     <script src="/vendor/lucide.min.js"></script>
     <script src="/canvas.js" type="module"></script>

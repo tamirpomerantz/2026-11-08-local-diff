@@ -284,10 +284,26 @@ select {
   background: transparent;
   transform-origin: center center;
   transform-style: preserve-3d;
+  transform: rotateX(0deg) rotateY(0deg) translateZ(0);
+  filter: none;
+  transition:
+    transform 0.28s cubic-bezier(0.4, 0, 0.6, 1),
+    filter 0.28s cubic-bezier(0.4, 0, 0.6, 1);
+}
+
+.drag-lift.is-lifted {
   transform: rotateX(10deg) rotateY(-8deg) translateZ(24px);
   filter: drop-shadow(0 4px 6px rgba(20, 20, 19, 0.06))
     drop-shadow(0 14px 32px rgba(20, 20, 19, 0.14))
     drop-shadow(0 28px 56px rgba(20, 20, 19, 0.1));
+}
+
+.drag-lift.is-settling {
+  transform: rotateX(0deg) rotateY(0deg) translateZ(0);
+  filter: none;
+  transition:
+    transform 0.24s cubic-bezier(0.22, 1, 0.36, 1),
+    filter 0.24s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .drag-lift-img {
@@ -297,13 +313,9 @@ select {
   margin: 0;
   padding: 0;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 20px;
   object-fit: cover;
   background: var(--card);
-}
-
-.drag-lift.is-group {
-  transform: rotateX(10deg) rotateY(-8deg) translateZ(24px);
 }
 
 .react-flow__node.exiting {
@@ -336,7 +348,10 @@ select {
     transform-style: flat;
   }
 
-  .drag-lift {
+  .drag-lift,
+  .drag-lift.is-lifted,
+  .drag-lift.is-settling {
+    transition: none;
     transform: none;
     filter: drop-shadow(0 14px 32px rgba(20, 20, 19, 0.14))
       drop-shadow(0 28px 56px rgba(20, 20, 19, 0.1));
@@ -444,7 +459,8 @@ select {
 }
 
 .canvas-image:hover .canvas-image-delete,
-.canvas-image-card.is-selected .canvas-image-delete {
+.canvas-image-card.is-selected .canvas-image-delete,
+.canvas-image-card.is-generating .canvas-image-delete {
   opacity: 1;
   pointer-events: auto;
 }
@@ -530,18 +546,17 @@ select {
   outline-color: var(--primary);
 }
 
-.describe-meal {
+.describe-meals {
   position: absolute;
   left: 50%;
   top: 50%;
   width: var(--eat-width, 220px);
   height: var(--eat-img-height, 180px);
   transform: translate(-50%, -50%);
-  object-fit: contain;
   pointer-events: none;
   z-index: 2;
-  opacity: 0.92;
   filter: blur(0);
+  opacity: 0.92;
   transition:
     width 0.45s cubic-bezier(0.22, 1, 0.36, 1),
     height 0.45s cubic-bezier(0.22, 1, 0.36, 1),
@@ -549,21 +564,72 @@ select {
     opacity 0.5s ease;
 }
 
+.describe-meal {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  border-radius: 10px;
+}
+
+.describe-meals[data-count="2"] .describe-meal,
+.describe-meals[data-count="3"] .describe-meal,
+.describe-meals[data-count="4"] .describe-meal {
+  inset: 10%;
+  width: 80%;
+  height: 80%;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.16);
+}
+
+.describe-meals[data-count="2"] .describe-meal:nth-child(1) {
+  transform: translate(-16%, 6%) rotate(-8deg);
+}
+.describe-meals[data-count="2"] .describe-meal:nth-child(2) {
+  transform: translate(16%, -6%) rotate(7deg);
+}
+
+.describe-meals[data-count="3"] .describe-meal:nth-child(1) {
+  transform: translate(-20%, 8%) rotate(-10deg);
+}
+.describe-meals[data-count="3"] .describe-meal:nth-child(2) {
+  transform: translate(0, -4%) rotate(2deg);
+}
+.describe-meals[data-count="3"] .describe-meal:nth-child(3) {
+  transform: translate(20%, 6%) rotate(9deg);
+}
+
+.describe-meals[data-count="4"] .describe-meal:nth-child(1) {
+  transform: translate(-22%, 10%) rotate(-11deg);
+}
+.describe-meals[data-count="4"] .describe-meal:nth-child(2) {
+  transform: translate(-6%, -8%) rotate(-3deg);
+}
+.describe-meals[data-count="4"] .describe-meal:nth-child(3) {
+  transform: translate(10%, 4%) rotate(5deg);
+}
+.describe-meals[data-count="4"] .describe-meal:nth-child(4) {
+  transform: translate(22%, -6%) rotate(10deg);
+}
+
 .describe.is-eating .prompt,
 .describe.is-eating .describe-status {
   opacity: 0;
 }
 
-.describe.is-waiting .describe-meal {
+.describe.is-waiting .describe-meals {
   width: calc(100% + 80px);
   height: calc(100% + 80px);
-  object-fit: cover;
   filter: blur(22px) saturate(1.08);
   opacity: 1;
   animation: describe-wait-drift 1.6s ease-in-out infinite alternate;
 }
 
-.describe.is-revealing .describe-meal {
+.describe.is-waiting .describe-meal {
+  object-fit: cover;
+}
+
+.describe.is-revealing .describe-meals {
   opacity: 0;
   filter: blur(28px);
 }
@@ -646,11 +712,11 @@ select {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .describe-meal {
+  .describe-meals {
     transition: none;
   }
 
-  .describe.is-waiting .describe-meal {
+  .describe.is-waiting .describe-meals {
     animation: none;
   }
 }
@@ -711,6 +777,28 @@ select {
   content: attr(data-placeholder);
   color: var(--muted-foreground);
   pointer-events: none;
+}
+
+.prompt-chip {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+  margin: 0 1px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--primary) 12%, var(--secondary));
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 18px;
+  white-space: nowrap;
+  user-select: all;
+}
+
+.prompt-chip[data-token="random_color"] {
+  background: color-mix(in srgb, #7c3aed 12%, var(--secondary));
+  color: #6d28d9;
 }
 
 .steps {
@@ -1027,10 +1115,100 @@ select {
 }
 
 .image-menu button i,
-.image-menu button svg {
+.image-menu button svg,
+.image-menu-sampler i,
+.image-menu-sampler svg {
   width: 14px;
   height: 14px;
   flex: 0 0 auto;
+  color: var(--muted-foreground);
+}
+
+.image-menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border);
+}
+
+.image-menu-sampler {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  line-height: 16px;
+  pointer-events: none;
+}
+
+.prompt-edit {
+  position: fixed;
+  z-index: 80;
+  min-width: 260px;
+  max-width: min(360px, calc(100vw - 16px));
+  padding: 6px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+}
+
+.prompt-edit form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.prompt-edit input {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+  font-size: 13px;
+  line-height: 18px;
+  outline: none;
+}
+
+.prompt-edit input::placeholder {
+  color: var(--muted-foreground);
+}
+
+.prompt-edit-go {
+  appearance: none;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+
+.prompt-edit-go:hover {
+  opacity: 0.92;
+}
+
+.prompt-edit-go svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+  fill: currentColor;
+}
+
+.prompt-edit[data-busy] {
+  pointer-events: none;
+}
+
+.prompt-edit[data-busy] input {
   color: var(--muted-foreground);
 }
 

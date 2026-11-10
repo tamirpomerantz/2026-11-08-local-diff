@@ -1,0 +1,88 @@
+3 - shift the original promt a bit - find similar words to describe the same thing
+8 - random noun dictonary
+
+error:
+app.js:1262 Klein generate failed: Models directory: /Users/tamirpomerantz/Library/Containers/com.liuliu.draw-things/Data/Documents/Models
+
+[1A[KStarting... [ ] 0  %
+[1A[KProcessing... [ ] 5  %
+[1A[KProcessing... [ ] 15 %
+[1A[KSampling... 1 / 4 [ ] 5  %
+[1A[KSampling... 2 / 4 [ ] 24 %
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[22A
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[21A
+]1337;File=name=cHJldmlldy5wbmc=;size=1039;width=29;preserveAspectRatio=1;inline=1;height=22:iVBORw0KGgoAAAANSUhEUgAAABAAAAAYCAIAAAB8wupbAAAAAXNSR0IArs4c6QAAADhlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAAqACAAQAAAABAAAAEKADAAQAAAABAAAAGAAAAAAn7RgJAAADhUlEQVQ4EQ2USY/bRhCFe2eTzeYmSrI8dgwHAZKfGiDX/K9cEgR2kIEdzyZrRElcu9lb+linevW+9wr+/tuvmCd6MYwBDHmADgdDxWYar5yxdbnRpFqcyjBeVuvngeBCAgCwh5jmjAWjjaPFumq+a5UyTGxv86sIdDHAeQBQgoJVbpz7fhI0vPaLN/afL0enzPm5W87j5fScmRBA0Igedq3khHiYUYGZ6e+/nV76LniDsvbhenN6DoQm1l+YmPSwzbITqlAgCALkQ0CI0krIPMFFS7HdbTcB4TRNNx9/wetc5DJkadBONFsUrxQYXoab75duQiJxqh9ssLRoLseXvz7/IXfltPqxuwIpZu0JC0DZoCFlUDk4X8cEkPzhv2eUFOLukC2kV7bMOCVMny/7Dz+SwNJzN87TbQHUBS5YtrhrVmxP1xncjmEFIqudm94fDvs3rYVRvFuaN01O0OX10WgMdddf19s87bIkTds37d3x9EzSLUQAsWwaTshZa+KC1aSyefr+7XJdCKN17e5PV2vmU99tCPJJdBvcZpUnHDlMHSE2MMsjPle1ZaL1cFE5mnJgZV0/d+eX+8dcEGp0xEsSLihY1/kMhMir/WVWcNOQ4C3CE8UFoU2zt7Tsbs5kqxAlQjyZRv1dG+w5tDqBPuLhcKk2hQChV4YzvK3l+PpCMAoxHGQeHUp31Q57u3vfZun2OCwBl8N5Pi+rhGQCwvqe5hUABluDAuMJxjRNWca+fvp67h4xgG45bnc18g4wldhbNyKZMkpylqeIo5hUdXm451DxvARQThbdBv50ihropXOaZwXVAWNjRwoxOnanuKosq6fJds//rpFRGSn7TZoKRttdK4gPrJmVpbwZF4XKsr1e+6SQy6BgXk+9/fPLo8jla3f+9Pfnh4eXyRBJvahyCgxNEuTWOQ5YqZ9+/riXstnLNi2PT08Y8c273d2+elenXEoeg4booBXyEYbzjlbmPEtZc0i8vbXlIUAg0yJaslqm5hlmzAHPV48I5eO8IKdFhg6HGquFJ8UMSLspRZ6j44lmdF81OWdpIIQggpOwr2suW4TC6/H72w8/RI9zZoZBx+wCTmNpWJrq6ylQRFBCoA+x3G8lVc637zcr4Ma4jMHDXRld4LYPlGrjWSopwGEJpCqKcV2ndWZ5k2U4vgdLgNVazyaJnYqvJ+oA3he1SDmA4H+tNgVSVzfXVgAAAABJRU5ErkJggg==
+[22A
+[1A[KSampling... 3 / 4 [ ] 44 %
+[1A[KSampling... 4 / 4 [█] 63 %
+
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[1B
+[2K[21A
+]1337;File=name=cHJldmlldy5wbmc=;size=1249;width=29;preserveAspectRatio=1;inline=1;height=22:iVBORw0KGgoAAAANSUhEUgAAABAAAAAYCAIAAAB8wupbAAAAAXNSR0IArs4c6QAAADhlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAAqACAAQAAAABAAAAEKADAAQAAAABAAAAGAAAAAAn7RgJAAAEV0lEQVQ4ERVTa2xTVQA+59xz37e37V03tnZl2JWAwFDBgYAQ4wCNRhkkEDBBfqDBR8REREZiIpiIGAKJAolEQkIicQiKPKq4gQ90wQBhQA2vIENe6/pY29ve2/s8x5p8P78f3xOeOv6taVPfsSiCCiQVCmSOo5AxbT2gNFmeA2s1z3EhpazAYgFhveLkyhUFi4QXiaIhBFxqVizfJ9qdoaEgK0UiLY5d9FxCHF8iEMsCci0RMQIGnlf513QJ9IEsYwuQjvGTs9kHVVuv+TVCcLPAuj5EGIe0aFJuUDxFRiKPBdbmXINhoBjOZB7KaihMmUg4Xi2XJVkjLMIAEV0vmJ7l5IYGCmWEGxBBgFT8/IMlL3RhyNMQwo4fjsZHitlEawuSJdZxjZH718+hxPQ5c2bH1Xzu8sL5Mx8Jhe5l9WJVB5iXBBQLKkJAyziUWbli+d372WvpdHLqhIGzp91aoGNaJ4V20bF2fnUQ1XRVDYiSSAngIWTqDjCDSqWy5TOCWZw9dZ7YFm3I35O45uCT0fVtiUN7j7Xfy3qQjAlqdf28KCBQz5zDNuK1cfHo2OSvW15d2r1i4+E+laPhZm39pnVHh4fvDJdKlSKlHsYIQ+pR16NKOH33RteMWEfXmkFxdHWbt2X7Hh7no/Hpy4LVsYn2vr+vPtshaSKLPYoBQ31ZbeQCgwc+b3/spa1vi65IF0+oYEUKadqBVcsHbjW/8zgYzeWaYvF6sRb03XBrpH9/aleqxMSErGlmK4TUOM91YKY8a8OX1SPbFnfNvfLPiOt6iOExJa4sKCfT1z9b3SlwgQACtZojN3OcQe1waOiPn3euXvBnHmdGS4ZhIMc0XZdqjNE2bVFA0TO50fampBhtZ90ImJicoVcvZHItibhZKpb1Ys0m9VrrgIFItHLrzPgn5m/4YFvv4b2Z1HZU6Mse/WbDrp7GyYu+O3vpqRaJ4VSWq0/OB5ap49CYJHh4KF3Y/l73uo/3tTao6YvnEnPUsY3z1yZuLjnR+KZnNIicwDGIYRkxFL95YM+Or3s/XLl0hFF+SPV6RF+w7t031ry/ZJb/Ws8XH23ceOnKJVVgOY5HvCTJouxVygdTR05dubhzW+/LnU+3xjRyYfeenrd2HE+v7flk2SuTzt8oykGFAfT/cYSC4rRZzw2kBrZu2rz501X7Tve3TXnRntj9+u4ff/n9+GXDKfWeuF0wREFheQzPnT1TKNqjhbwBaP+xn/r/Oj9hfOu4JhGwWLQK5TJDYcMN4k2Ktj3/zLwpyRj8rf+k4zK26xhGFYlcxTAuDt4evHy1VByFjnntjj5xavvCufNmdj7aImEs8DB17HtiUyEYgQiYpmFbJoMh8TzDJ4YPGNtiJDUWlCmAfP3ndQcBSbAAMvLDXDjSKLMkGLEdz/OAAoDr1gmQr/+P+sD3oeu7IocpVou1gqQGASNXiG+bFs/W5bMsg1xKASGEIt8yHd+DWJEV6T9ycCFkSl8ReQAAAABJRU5ErkJggg==
+[22A
+[22B
+Error: Generation failed (no tensors returned)
+

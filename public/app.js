@@ -1,15 +1,217 @@
 const subjectEl = document.querySelector("#prompt-subject");
 const styleEl = document.querySelector("#prompt-style");
 const promptEls = [subjectEl, styleEl];
+const PROMPT_TOKENS = [
+  { id: "random_color", label: "random_color" },
+  { id: "random", label: "random" },
+];
+const TOKEN_BY_ID = Object.fromEntries(PROMPT_TOKENS.map((token) => [token.id, token]));
+const TOKEN_FIND_RE = /\{random_color\}|\{random\}|\brandom_color\b|\brandom\b/gi;
+const TOKEN_BRACE_RE = /\{random_color\}|\{random\}/gi;
+
+function tokenIdFromLexeme(lexeme) {
+  const inner = String(lexeme).startsWith("{") ? String(lexeme).slice(1, -1) : String(lexeme);
+  const id = inner.toLowerCase();
+  return TOKEN_BY_ID[id] ? id : "";
+}
+
+function createPromptChip(id) {
+  const token = TOKEN_BY_ID[id] ?? TOKEN_BY_ID.random;
+  const chip = document.createElement("span");
+  chip.className = "prompt-chip";
+  chip.dataset.token = token.id;
+  chip.contentEditable = "false";
+  chip.spellcheck = false;
+  chip.setAttribute("aria-label", token.label);
+  chip.textContent = token.label;
+  return chip;
+}
+
+function serializePrompt(el) {
+  const chunks = [];
+  const walk = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      chunks.push((node.nodeValue ?? "").replace(/\u00a0/g, " "));
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    if (node.dataset?.token && TOKEN_BY_ID[node.dataset.token]) {
+      chunks.push(`{${node.dataset.token}}`);
+      return;
+    }
+    if (node.tagName === "BR") {
+      chunks.push("\n");
+      return;
+    }
+    const block = /^(DIV|P|LI)$/.test(node.tagName);
+    if (block && chunks.length && !chunks[chunks.length - 1].endsWith("\n")) chunks.push("\n");
+    for (const child of node.childNodes) walk(child);
+  };
+  for (const child of el.childNodes) walk(child);
+  return chunks.join("").replace(/\n+$/g, "").trim();
+}
+
+function appendPromptLine(parent, line) {
+  const parts = String(line).split(new RegExp(TOKEN_BRACE_RE.source, "gi"));
+  for (const part of parts) {
+    if (!part) continue;
+    const token = tokenIdFromLexeme(part);
+    if (token) parent.append(createPromptChip(token));
+    else parent.append(document.createTextNode(part));
+  }
+}
+
+function placeCaretInText(node, offset) {
+  const range = document.createRange();
+  const max = node.nodeValue?.length ?? 0;
+  range.setStart(node, Math.max(0, Math.min(offset, max)));
+  range.collapse(true);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+function placeCaretAfter(node) {
+  const range = document.createRange();
+  range.setStartAfter(node);
+  range.collapse(true);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+function followingChar(node) {
+  let sib = node.nextSibling;
+  while (sib) {
+    if (sib.nodeType === Node.TEXT_NODE) {
+      if (!sib.nodeValue) {
+        sib = sib.nextSibling;
+        continue;
+      }
+      return sib.nodeValue[0] ?? "";
+    }
+    if (sib.nodeType === Node.ELEMENT_NODE) return " ";
+    sib = sib.nextSibling;
+  }
+  return "";
+}
+
+function tokenMatchesInText(text, { includeTrailing = false, followedBy = "" } = {}) {
+  const matches = [];
+  const re = new RegExp(TOKEN_FIND_RE.source, "gi");
+  let match;
+  while ((match = re.exec(text))) {
+    const start = match.index;
+    const end = start + match[0].length;
+    const id = tokenIdFromLexeme(match[0]);
+    if (!id) continue;
+    if (match[0].startsWith("{")) {
+      matches.push({ start, end, id });
+      continue;
+    }
+    const next = text[end] ?? followedBy;
+    const delimited = /[\s.,;:!?)\]"'/]/.test(next);
+    if (delimited || includeTrailing) matches.push({ start, end, id });
+  }
+  return matches;
+}
+
+function replaceTokenMatches(node, matches, caretOffset) {
+  const text = node.nodeValue ?? "";
+  const parent = node.parentNode;
+  if (!parent || !matches.length) return;
+  const caretHere = caretOffset >= 0;
+  let caretNode = null;
+  let caretAt = 0;
+  let caretAfterNode = null;
+  const frag = document.createDocumentFragment();
+  let cursor = 0;
+  const pushText = (value, force = false) => {
+    if (!value && !force) return null;
+    const next = document.createTextNode(value);
+    frag.append(next);
+    return next;
+  };
+  for (const match of matches) {
+    const before = pushText(text.slice(cursor, match.start));
+    if (caretHere && caretOffset <= match.start && !caretNode && !caretAfterNode) {
+      caretNode = before;
+      caretAt = caretOffset - cursor;
+    }
+    const chip = createPromptChip(match.id);
+    frag.append(chip);
+    if (caretHere && caretOffset > match.start && caretOffset <= match.end) {
+      caretAfterNode = chip;
+    }
+    cursor = match.end;
+  }
+  const rest = text.slice(cursor);
+  const after = rest
+    ? pushText(rest)
+    : caretHere && !caretNode && !caretAfterNode
+      ? pushText("", true)
+      : null;
+  if (caretHere && !caretNode && !caretAfterNode) {
+    caretNode = after;
+    caretAt = Math.max(0, caretOffset - cursor);
+  }
+  parent.replaceChild(frag, node);
+  if (!caretHere) return;
+  if (caretAfterNode) placeCaretAfter(caretAfterNode);
+  else if (caretNode) placeCaretInText(caretNode, caretAt);
+  else if (after) placeCaretInText(after, 0);
+}
+
+let promotingTokens = false;
+
+function promotePromptTokens(el, { includeTrailing = false } = {}) {
+  if (!el || promotingTokens) return false;
+  const sel = window.getSelection();
+  const hasCaret = Boolean(sel?.rangeCount && el.contains(sel.anchorNode));
+  const caretNode = hasCaret ? sel.anchorNode : null;
+  const caretOffset = hasCaret ? sel.anchorOffset : -1;
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue) return NodeFilter.FILTER_REJECT;
+      if (node.parentElement?.closest("[data-token]")) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  let changed = false;
+  promotingTokens = true;
+  try {
+    for (const node of nodes) {
+      if (!node.parentNode) continue;
+      const offset = node === caretNode ? caretOffset : -1;
+      const matches = tokenMatchesInText(node.nodeValue ?? "", {
+        includeTrailing,
+        followedBy: followingChar(node),
+      });
+      if (!matches.length) continue;
+      changed = true;
+      replaceTokenMatches(node, matches, offset);
+    }
+  } finally {
+    promotingTokens = false;
+  }
+  return changed;
+}
 
 function fieldText(el) {
-  return (el.innerText ?? "").replace(/\u00a0/g, " ").trim();
+  return serializePrompt(el);
 }
 
 function setField(el, text) {
   const value = String(text ?? "");
-  el.textContent = value;
-  if (!value.trim()) el.replaceChildren();
+  el.replaceChildren();
+  if (!value.trim()) return;
+  const lines = value.split("\n");
+  lines.forEach((line, index) => {
+    if (index > 0) el.append(document.createElement("br"));
+    appendPromptLine(el, line);
+  });
 }
 
 function subjectText() {
@@ -49,6 +251,9 @@ const slotsEl = document.querySelector("#slots");
 const stripPlayEl = document.querySelector("#strip-play");
 const ratioMenuEl = document.querySelector("#ratio-menu");
 const imageMenuEl = document.querySelector("#image-menu");
+const promptEditEl = document.querySelector("#prompt-edit");
+const promptEditForm = document.querySelector("#prompt-edit-form");
+const promptEditInput = document.querySelector("#prompt-edit-input");
 const ENLARGE_SHORT_SIDE = 1024;
 const ENLARGE_STRENGTH = 0.3;
 
@@ -359,6 +564,220 @@ function closeImageMenu() {
   imageMenuEl.style.overflowY = "";
 }
 
+let promptEditTarget = null;
+let promptEditRaf = 0;
+
+function stopPromptEditFollow() {
+  if (promptEditRaf) cancelAnimationFrame(promptEditRaf);
+  promptEditRaf = 0;
+}
+
+function promptEditAnchorRect() {
+  const id = promptEditTarget?.nodeId;
+  if (!id) return null;
+  const node = document.querySelector(`.react-flow__node[data-id="${CSS.escape(String(id))}"]`);
+  return node?.getBoundingClientRect() ?? null;
+}
+
+function placePromptEdit() {
+  if (promptEditEl.hidden) return;
+  const rect = promptEditAnchorRect();
+  if (!rect || rect.width < 2 || rect.height < 2) return;
+  promptEditEl.style.maxHeight = "none";
+  promptEditEl.style.overflowY = "";
+  promptEditEl.style.left = "0px";
+  promptEditEl.style.top = "0px";
+  const box = promptEditEl.getBoundingClientRect();
+  const margin = 8;
+  const gap = 12;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const boxW = box.width;
+  const boxH = box.height;
+  let left = rect.right + gap;
+  if (left + boxW > vw - margin) left = rect.left - gap - boxW;
+  left = Math.min(Math.max(left, margin), vw - margin - boxW);
+  let top = rect.top + (rect.height - boxH) / 2;
+  top = Math.min(Math.max(top, margin), vh - margin - boxH);
+  promptEditEl.style.left = `${Math.round(left)}px`;
+  promptEditEl.style.top = `${Math.round(top)}px`;
+}
+
+function followPromptEdit() {
+  placePromptEdit();
+  if (promptEditEl.hidden) {
+    promptEditRaf = 0;
+    return;
+  }
+  promptEditRaf = window.requestAnimationFrame(followPromptEdit);
+}
+
+function closePromptEdit() {
+  stopPromptEditFollow();
+  promptEditEl.hidden = true;
+  promptEditEl.removeAttribute("data-busy");
+  promptEditEl.style.maxHeight = "";
+  promptEditEl.style.overflowY = "";
+  promptEditInput.disabled = false;
+  promptEditInput.value = "";
+  promptEditTarget = null;
+}
+
+function openPromptEdit(detail) {
+  const image = images.find((item) => item.filename === detail?.image?.filename) ?? detail?.image;
+  if (!image?.url) return;
+  closeRatioMenu();
+  closeSamplerMenu();
+  closeImageMenu();
+  promptEditTarget = { image, nodeId: detail.nodeId || image.filename };
+  promptEditEl.hidden = false;
+  promptEditEl.removeAttribute("data-busy");
+  promptEditInput.disabled = false;
+  promptEditInput.value = "";
+  promptEditInput.placeholder = "make it red…";
+  placePromptEdit();
+  stopPromptEditFollow();
+  promptEditRaf = window.requestAnimationFrame(followPromptEdit);
+  paintIcons(promptEditEl);
+  boardPeek?.latch();
+  window.requestAnimationFrame(() => promptEditInput.focus());
+}
+
+function reviseJobFor(image, nodeId) {
+  const known = images.find((item) => item.filename === image?.filename) ?? image;
+  const aspect = aspectFromImage(known) || known.aspect || lastAspect();
+  const ratio = ratioFor(aspect);
+  return {
+    known,
+    job: {
+      id: `job-${++jobSeq}-${Date.now()}`,
+      slotId: `revise-${jobSeq}`,
+      aspect: ratio.id,
+      width: ratio.width,
+      height: ratio.height,
+      subject: "",
+      style: "",
+      steps: known.steps === 2 || known.steps === 4 ? known.steps : selectedSteps(),
+      sampler: samplerById(known.sampler) ? known.sampler : resolveSampler(),
+      source: known.filename,
+      beside: nodeId || known.filename,
+    },
+  };
+}
+
+function showGeneratingSlot(job) {
+  kleinLog("app", "revise-start", { id: job.id, image: job.source, aspect: job.aspect });
+  window.dispatchEvent(
+    new CustomEvent("klein:generate-start", {
+      detail: {
+        beside: job.beside,
+        slots: [
+          {
+            id: job.id,
+            aspect: job.aspect,
+            width: job.width,
+            height: job.height,
+          },
+        ],
+      },
+    }),
+  );
+}
+
+function enqueuePreparedJob(job) {
+  if (job.cancelled) return;
+  trackJob(job);
+  job.queued = true;
+  queueTotal += 1;
+  generateQueue.push(job);
+  pumpGenerateQueue();
+}
+
+function abortGeneratingSlot(job, message) {
+  if (job) job.cancelled = true;
+  trackedJobs.delete(job?.id);
+  window.dispatchEvent(
+    new CustomEvent("klein:generate-error", {
+      detail: { id: job.id, error: message || "" },
+    }),
+  );
+  showError(message);
+  statusEl.textContent = "";
+}
+
+async function rewriteCanvasPrompt(image, nodeId, { path, pending, fail }) {
+  const { job, known } = reviseJobFor(image, nodeId);
+  if (!known?.filename && !known?.url) return;
+  showError("");
+  statusEl.textContent = pending;
+  const abort = trackJob(job);
+  showGeneratingSlot(job);
+  try {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: known.filename,
+        subject: known.subject ?? "",
+        style: known.style ?? "",
+      }),
+      signal: abort.signal,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || fail);
+    if (job.cancelled) return;
+    job.subject = String(payload.subject ?? "").trim();
+    job.style = String(payload.style ?? "").trim();
+    if (!combinePrompt(job.subject, job.style)) throw new Error("The revised prompt was empty.");
+    enqueuePreparedJob(job);
+  } catch (error) {
+    if (error?.name === "AbortError" || job.cancelled) return;
+    abortGeneratingSlot(job, error.message);
+  }
+}
+
+async function submitPromptEdit(event) {
+  event.preventDefault();
+  const change = promptEditInput.value.trim();
+  if (!change) {
+    promptEditInput.focus();
+    return;
+  }
+  const target = promptEditTarget;
+  const image = target?.image;
+  if (!image?.filename && !image?.url) return;
+  const known = images.find((item) => item.filename === image.filename) ?? image;
+  const { job } = reviseJobFor(known, target.nodeId);
+  closePromptEdit();
+  showError("");
+  statusEl.textContent = "Revising prompt…";
+  const abort = trackJob(job);
+  showGeneratingSlot(job);
+  try {
+    const response = await fetch("/api/revise", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: known.filename,
+        subject: known.subject ?? "",
+        style: known.style ?? "",
+        change,
+      }),
+      signal: abort.signal,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || "Could not revise prompt.");
+    if (job.cancelled) return;
+    job.subject = String(payload.subject ?? "").trim();
+    job.style = String(payload.style ?? "").trim();
+    if (!combinePrompt(job.subject, job.style)) throw new Error("The revised prompt was empty.");
+    enqueuePreparedJob(job);
+  } catch (error) {
+    if (error?.name === "AbortError" || job.cancelled) return;
+    abortGeneratingSlot(job, error.message);
+  }
+}
+
 function sizeForShortSide(width, height, shortSide = ENLARGE_SHORT_SIDE) {
   const w = Math.max(1, Number(width) || 1);
   const h = Math.max(1, Number(height) || 1);
@@ -424,6 +843,8 @@ function enlargeCanvasImage(image, nodeId) {
     mode: "enlarge",
     beside: nodeId || known.filename,
   };
+  trackJob(job);
+  job.queued = true;
   queueTotal += 1;
   generateQueue.push(job);
   kleinLog("app", "enlarge-start", { id: job.id, image: job.image, beside: job.beside });
@@ -453,6 +874,7 @@ function openImageMenu(detail) {
   if (!multi && !image?.url) return;
   closeRatioMenu();
   closeSamplerMenu();
+  closePromptEdit();
   imageMenuEl.replaceChildren();
   const actions = multi
     ? [
@@ -463,6 +885,10 @@ function openImageMenu(detail) {
         { id: "copy", label: "Copy", icon: "copy" },
         { id: "download", label: "Download", icon: "download" },
         { id: "enlarge", label: "Enlarge", icon: "maximize-2" },
+        { id: "closeup", label: "Close up", icon: "zoom-in" },
+        { id: "prompt", label: "Prompt", icon: "pencil" },
+        { id: "twin", label: "Twin image", icon: "images" },
+        { id: "shuffle", label: "Shuffle", icon: "shuffle" },
       ];
   for (const action of actions) {
     const button = document.createElement("button");
@@ -475,6 +901,26 @@ function openImageMenu(detail) {
         if (action.id === "copy") await copyCanvasImage(image);
         else if (action.id === "download") downloadCanvasImage(image);
         else if (action.id === "enlarge") enlargeCanvasImage(image, detail.nodeId);
+        else if (action.id === "closeup") {
+          await rewriteCanvasPrompt(image, detail.nodeId, {
+            path: "/api/closeup",
+            pending: "Framing a close up…",
+            fail: "Could not write a close-up prompt.",
+          });
+        } else if (action.id === "prompt") openPromptEdit(detail);
+        else if (action.id === "twin") {
+          await rewriteCanvasPrompt(image, detail.nodeId, {
+            path: "/api/twin",
+            pending: "Writing a twin prompt…",
+            fail: "Could not write a twin prompt.",
+          });
+        } else if (action.id === "shuffle") {
+          await rewriteCanvasPrompt(image, detail.nodeId, {
+            path: "/api/shuffle",
+            pending: "Shuffling prompt…",
+            fail: "Could not shuffle prompt.",
+          });
+        }
         else if (action.id === "grid") {
           window.dispatchEvent(
             new CustomEvent("klein:selection-grid", { detail: { nodeIds: detail.nodeIds } }),
@@ -489,6 +935,19 @@ function openImageMenu(detail) {
       }
     });
     imageMenuEl.append(button);
+  }
+  if (!multi) {
+    const sampler = samplerById(image.sampler);
+    if (sampler) {
+      const sep = document.createElement("div");
+      sep.className = "image-menu-sep";
+      const meta = document.createElement("div");
+      meta.className = "image-menu-sampler";
+      meta.setAttribute("role", "note");
+      meta.title = `Sampler used: ${sampler.name}`;
+      meta.append(lucideIcon("blend"), document.createTextNode(sampler.name));
+      imageMenuEl.append(sep, meta);
+    }
   }
   imageMenuEl.hidden = false;
   placeOnScreen(imageMenuEl, detail.x, detail.y);
@@ -774,27 +1233,42 @@ function storedPartFor(source, part) {
   return String(part === "style" ? known.style ?? "" : known.subject ?? "").trim();
 }
 
-async function describeWithFal(imageDataUrl, filename, part, signal) {
+const COMBINE_MAX_IMAGES = 4;
+
+async function describeWithFal(entries, part, signal) {
+  const list = (Array.isArray(entries) ? entries : [entries]).filter((item) => item?.image);
+  if (!list.length) throw new Error("Drop an image onto the prompt to describe it.");
   const task = part === "style" ? "style" : "subject";
+  const combine = list.length > 1;
   const describeResponse = await fetch("/api/describe", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      image: imageDataUrl,
-      part: task,
-      ...(filename ? { filename } : {}),
-    }),
+    body: JSON.stringify(
+      combine
+        ? {
+            images: list.map((item) => ({
+              image: item.image,
+              ...(item.filename ? { filename: item.filename } : {}),
+            })),
+            part: task,
+          }
+        : {
+            image: list[0].image,
+            part: task,
+            ...(list[0].filename ? { filename: list[0].filename } : {}),
+          },
+    ),
     signal,
   });
   const described = await describeResponse.json();
   if (!describeResponse.ok) throw new Error(described.error || "Describe failed.");
   const text = String(described[task] ?? "").trim();
   if (!text) throw new Error("Describe failed.");
-  if (filename) rememberDescription(filename, { [task]: text });
+  if (!combine && list[0].filename) rememberDescription(list[0].filename, { [task]: text });
   return text;
 }
 
-const mealObjectUrls = { subject: "", style: "" };
+const mealObjectUrls = { subject: [], style: [] };
 
 function releaseMealUrl(part) {
   if (!part) {
@@ -802,10 +1276,8 @@ function releaseMealUrl(part) {
     releaseMealUrl("style");
     return;
   }
-  if (mealObjectUrls[part]) {
-    URL.revokeObjectURL(mealObjectUrls[part]);
-    mealObjectUrls[part] = "";
-  }
+  for (const url of mealObjectUrls[part] || []) URL.revokeObjectURL(url);
+  mealObjectUrls[part] = [];
 }
 
 function partOfBox(box) {
@@ -823,14 +1295,62 @@ function mealSizeFromNatural(width, height, box = subjectBox) {
   return { width: width * scale, height: height * scale };
 }
 
-function boxMeal(box) {
-  return box?.querySelector(".describe-meal");
+function boxMeals(box) {
+  return box?.querySelector(".describe-meals");
+}
+
+function mealUrlsFrom(detail) {
+  if (Array.isArray(detail?.urls) && detail.urls.length) return detail.urls.filter(Boolean).slice(0, COMBINE_MAX_IMAGES);
+  return detail?.url ? [detail.url] : [];
+}
+
+const DRAG_LIFT_OUT_MS = 280;
+let dragLiftGen = 0;
+let dragLiftHideTimer = 0;
+
+function hideDragLiftLayer() {
+  clearTimeout(dragLiftHideTimer);
+  dragLiftHideTimer = 0;
+  delete dragLiftLayer.dataset.easingIn;
+  dragLiftLayer.hidden = true;
+  dragLiftLayer.replaceChildren();
+}
+
+function notifyDragLiftSettled() {
+  window.dispatchEvent(new CustomEvent("klein:drag-lift-settled"));
+}
+
+function settleDragLift(immediate = false) {
+  const wraps = [...dragLiftLayer.querySelectorAll(".drag-lift")];
+  const gen = dragLiftGen;
+  let finished = false;
+  const finish = () => {
+    if (finished || gen !== dragLiftGen) return;
+    finished = true;
+    dragLiftGen += 1;
+    hideDragLiftLayer();
+    notifyDragLiftSettled();
+  };
+  if (immediate || reduceDescribeMotion() || !wraps.length || dragLiftLayer.hidden) {
+    finish();
+    return;
+  }
+  const onEnd = (event) => {
+    if (event.propertyName && event.propertyName !== "transform") return;
+    finish();
+  };
+  for (const wrap of wraps) {
+    wrap.classList.remove("is-lifted");
+    wrap.classList.add("is-settling");
+    wrap.addEventListener("transitionend", onEnd, { once: true });
+  }
+  clearTimeout(dragLiftHideTimer);
+  dragLiftHideTimer = window.setTimeout(finish, DRAG_LIFT_OUT_MS);
 }
 
 function setDragLift(detail) {
   if (!detail?.on) {
-    dragLiftLayer.hidden = true;
-    dragLiftLayer.replaceChildren();
+    settleDragLift(Boolean(detail?.immediate));
     return;
   }
   const items = Array.isArray(detail.items) && detail.items.length
@@ -839,13 +1359,23 @@ function setDragLift(detail) {
       ? [detail]
       : [];
   if (!items.length) {
-    dragLiftLayer.hidden = true;
-    dragLiftLayer.replaceChildren();
+    settleDragLift(true);
     return;
+  }
+  const resuming =
+    !dragLiftLayer.hidden &&
+    Boolean(dragLiftLayer.querySelector(".drag-lift")) &&
+    !dragLiftLayer.querySelector(".drag-lift.is-settling");
+  if (!resuming) {
+    dragLiftGen += 1;
+    clearTimeout(dragLiftHideTimer);
+    dragLiftHideTimer = 0;
+    dragLiftLayer.dataset.easingIn = "1";
   }
   dragLiftLayer.hidden = false;
   const existing = [...dragLiftLayer.querySelectorAll(".drag-lift")];
   while (existing.length > items.length) existing.pop().remove();
+  const easingIn = dragLiftLayer.dataset.easingIn === "1";
   items.forEach((item, index) => {
     let wrap = existing[index];
     if (!wrap) {
@@ -860,10 +1390,23 @@ function setDragLift(detail) {
     const img = wrap.querySelector("img");
     if (item.url && img.getAttribute("src") !== item.url) img.src = item.url;
     wrap.classList.toggle("is-group", detail.mode === "group");
+    wrap.classList.remove("is-settling");
+    if (resuming && !easingIn) wrap.classList.add("is-lifted");
     wrap.style.left = `${Math.round(item.x || 0)}px`;
     wrap.style.top = `${Math.round(item.y || 0)}px`;
     wrap.style.width = `${Math.round(item.width || 0)}px`;
     wrap.style.height = `${Math.round(item.height || 0)}px`;
+  });
+  if (resuming) return;
+  const gen = dragLiftGen;
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
+      if (gen !== dragLiftGen) return;
+      delete dragLiftLayer.dataset.easingIn;
+      for (const wrap of dragLiftLayer.querySelectorAll(".drag-lift")) {
+        wrap.classList.add("is-lifted");
+      }
+    });
   });
 }
 
@@ -881,22 +1424,32 @@ function prepareEat(box, { width, height, force = false } = {}) {
   box.style.minHeight = `${Math.round(imgH + 50)}px`;
   box.style.setProperty("--eat-width", `${Math.round(imgW)}px`);
   box.style.setProperty("--eat-img-height", `${Math.round(imgH)}px`);
-  const meal = boxMeal(box);
-  if (meal) {
-    meal.hidden = true;
-    meal.removeAttribute("src");
+  const meals = boxMeals(box);
+  if (meals) {
+    meals.hidden = true;
+    meals.replaceChildren();
+    delete meals.dataset.count;
   }
 }
 
-function beginEat(box, { url, width, height } = {}) {
+function beginEat(box, { url, urls, width, height } = {}) {
   prepareEat(box, { width, height, force: true });
   if (!box) return;
-  box.classList.add("is-eating");
-  const meal = boxMeal(box);
-  if (meal && url) {
-    meal.hidden = false;
-    meal.src = url;
+  const meals = boxMeals(box);
+  const list = mealUrlsFrom({ url, urls });
+  if (meals) {
+    meals.replaceChildren();
+    meals.dataset.count = String(list.length);
+    meals.hidden = !list.length;
+    for (const src of list) {
+      const img = document.createElement("img");
+      img.className = "describe-meal";
+      img.alt = "";
+      img.src = src;
+      meals.append(img);
+    }
   }
+  box.classList.add("is-eating");
 }
 
 function endEat(box, { keepMealUrl = false, force = false } = {}) {
@@ -911,10 +1464,11 @@ function endEat(box, { keepMealUrl = false, force = false } = {}) {
   box.style.minHeight = "";
   box.style.removeProperty("--eat-width");
   box.style.removeProperty("--eat-img-height");
-  const meal = boxMeal(box);
-  if (meal) {
-    meal.removeAttribute("src");
-    meal.hidden = true;
+  const meals = boxMeals(box);
+  if (meals) {
+    meals.replaceChildren();
+    meals.hidden = true;
+    delete meals.dataset.count;
   }
   if (!keepMealUrl) releaseMealUrl(part);
 }
@@ -933,8 +1487,8 @@ function settleWaiting(box, gen) {
   if (!box || (gen != null && describeGen[part] !== gen)) return false;
   box.classList.remove("is-eating", "is-swallowing", "is-drop-target", "is-revealing");
   box.classList.add("is-waiting");
-  const meal = boxMeal(box);
-  if (meal?.src) meal.hidden = false;
+  const meals = boxMeals(box);
+  if (meals?.childElementCount) meals.hidden = false;
   return true;
 }
 
@@ -949,18 +1503,24 @@ async function fadeWaiting(box, gen, part) {
   endEat(box, { force: true });
 }
 
-async function presentFileMeal(file, box, gen) {
+async function presentFileMeals(files, box, gen) {
   const part = partOfBox(box);
+  const list = (Array.isArray(files) ? files : [files]).filter((file) => file instanceof Blob).slice(0, COMBINE_MAX_IMAGES);
+  if (!list.length) return;
   releaseMealUrl(part);
-  mealObjectUrls[part] = URL.createObjectURL(file);
+  const urls = list.map((file) => {
+    const url = URL.createObjectURL(file);
+    mealObjectUrls[part].push(url);
+    return url;
+  });
   const size = await new Promise((resolve) => {
     const img = new Image();
     img.onload = () => resolve(mealSizeFromNatural(img.naturalWidth, img.naturalHeight, box));
     img.onerror = () => resolve({ width: 180, height: 180 });
-    img.src = mealObjectUrls[part];
+    img.src = urls[0];
   });
   if (gen != null && describeGen[part] !== gen) return;
-  beginEat(box, { url: mealObjectUrls[part], ...size });
+  beginEat(box, { urls, ...size });
 }
 
 function applyDescribedPart(part, text) {
@@ -969,8 +1529,16 @@ function applyDescribedPart(part, text) {
   renderDescribe();
 }
 
+function asDescribeSources(source) {
+  const list = Array.isArray(source) ? source : source ? [source] : [];
+  return list.filter(Boolean).slice(0, COMBINE_MAX_IMAGES);
+}
+
 async function describeFromSource(source, { alreadyEating = false, part = "subject" } = {}) {
+  const sources = asDescribeSources(source);
+  if (!sources.length) return null;
   const task = part === "style" ? "style" : "subject";
+  const combine = sources.length > 1;
   const box = describeBoxes[task];
   showError("");
   describeAbort[task]?.abort();
@@ -979,32 +1547,52 @@ async function describeFromSource(source, { alreadyEating = false, part = "subje
   const gen = ++describeGen[task];
   describing[task] = true;
   const status = box?.querySelector(".describe-status");
-  if (status) status.textContent = "describing…";
-  describeStatus(task === "style" ? "Describing style…" : "Describing subject…");
+  if (status) status.textContent = combine ? "combining…" : "describing…";
+  describeStatus(
+    combine
+      ? task === "style"
+        ? "Combining styles…"
+        : "Combining subjects…"
+      : task === "style"
+        ? "Describing style…"
+        : "Describing subject…",
+  );
   renderDescribe();
   boardPeek?.latch();
   let revealed = false;
   try {
     if (!alreadyEating) {
-      if (source?.file) await presentFileMeal(source.file, box, gen);
-      else if (source?.url) beginEat(box, { url: source.url, width: source.width, height: source.height });
+      const files = sources.map((item) => item.file).filter((file) => file instanceof Blob);
+      if (files.length) await presentFileMeals(files, box, gen);
+      else {
+        const first = sources[0];
+        beginEat(box, {
+          urls: sources.map((item) => item.url).filter(Boolean),
+          url: first.url,
+          width: first.width,
+          height: first.height,
+        });
+      }
     }
     if (describeGen[task] !== gen) return null;
     settleWaiting(box, gen);
-    const stored = storedPartFor(source, task);
-    let text = stored;
+    let text = combine ? "" : storedPartFor(sources[0], task);
     if (!text) {
-      const blob = await blobFromSource(source);
-      const small = await shrinkForDescribe(blob);
-      if (describeGen[task] !== gen) return null;
-      text = await describeWithFal(await blobToDataUrl(small), source?.filename, task, ac.signal);
+      const entries = [];
+      for (const item of sources) {
+        const blob = await blobFromSource(item);
+        const small = await shrinkForDescribe(blob);
+        if (describeGen[task] !== gen) return null;
+        entries.push({ image: await blobToDataUrl(small), filename: item.filename });
+      }
+      text = await describeWithFal(entries, task, ac.signal);
     } else {
       await waitDescribe(450);
     }
     if (describeGen[task] !== gen) return null;
     describing[task] = false;
     applyDescribedPart(task, text);
-    describeStatus("Description ready.");
+    describeStatus(combine ? "Combination ready." : "Description ready.");
     revealed = true;
     await fadeWaiting(box, gen, task);
     return text;
@@ -1135,6 +1723,38 @@ let queueRunning = false;
 let queueDone = 0;
 let queueTotal = 0;
 let jobSeq = 0;
+const trackedJobs = new Map();
+let activeGenerate = null;
+
+function jobIdFrom(value) {
+  return String(value ?? "").replace(/^gen:/, "");
+}
+
+function trackJob(job) {
+  const existing = trackedJobs.get(job.id);
+  if (existing) return existing.abort;
+  const abort = new AbortController();
+  trackedJobs.set(job.id, { job, abort });
+  return abort;
+}
+
+function cancelGenerateJob(rawId) {
+  const jobId = jobIdFrom(rawId);
+  if (!jobId) return;
+  const tracked = trackedJobs.get(jobId);
+  const job = tracked?.job;
+  const wasQueued = Boolean(job?.queued);
+  if (job) job.cancelled = true;
+  generateQueue = generateQueue.filter((item) => item.id !== jobId && item.slotId !== jobId);
+  tracked?.abort.abort();
+  trackedJobs.delete(jobId);
+  if (activeGenerate && (activeGenerate.job.id === jobId || activeGenerate.job.slotId === jobId)) {
+    activeGenerate.job.cancelled = true;
+    activeGenerate.controller.abort();
+  }
+  if (wasQueued) queueTotal = Math.max(0, queueTotal - 1);
+  kleinLog("app", "generate-cancel", { id: jobId });
+}
 
 function queueStatus(aspect, extra = "", verb = "Generating") {
   const current = Math.min(queueDone + 1, Math.max(queueTotal, 1));
@@ -1145,86 +1765,103 @@ function queueStatus(aspect, extra = "", verb = "Generating") {
 }
 
 async function runGenerateJob(job) {
+  if (job.cancelled) return "cancelled";
   let generated = null;
+  const controller = trackedJobs.get(job.id)?.abort ?? new AbortController();
+  activeGenerate = { job, controller };
   setBusy(true, queueStatus(job.aspect, "", job.mode === "enlarge" ? "Enlarging" : "Generating"));
-  const response = await fetch("/api/generate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      subject: job.subject,
-      style: job.style,
-      steps: job.steps,
-      sampler: job.sampler,
-      aspect: job.aspect,
-      source: job.source,
-      ...(job.mode === "enlarge"
-        ? {
-            mode: "enlarge",
-            image: job.image,
-            strength: job.strength,
-          }
-        : {}),
-    }),
-  });
-  if (response.status === 409) {
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    generateQueue.unshift(job);
-    return false;
-  }
-  if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.error || "Generation failed.");
-  }
-  await readSseEvents(response, (event) => {
-    if (event.type === "preview") {
-      window.dispatchEvent(
-        new CustomEvent("klein:generate-preview", {
-          detail: { id: job.id, url: event.url },
-        }),
-      );
-    } else if (event.type === "progress") {
-      statusEl.textContent = queueStatus(
-        job.aspect,
-        `${event.step}/${event.total}`,
-        job.mode === "enlarge" ? "Enlarging" : "Generating",
-      );
-    } else if (event.type === "status") {
-      statusEl.textContent = event.message || statusEl.textContent;
-    } else if (event.type === "model") {
-      applyModels({
-        klein: {
-          ...models.klein,
-          action: event.action ?? models.klein.action,
-          percent: event.percent ?? models.klein.percent,
-          message: event.message ?? models.klein.message,
-          loaded: event.kleinLoaded ?? models.klein.loaded,
-        },
-        memoryGb: event.memoryGb ?? models.memoryGb,
-      });
-    } else if (event.type === "done") {
-      generated = event.image;
-    } else if (event.type === "error") {
-      throw new Error(event.error || "Generation failed.");
+  try {
+    const response = await fetch("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        subject: job.subject,
+        style: job.style,
+        steps: job.steps,
+        sampler: job.sampler,
+        aspect: job.aspect,
+        source: job.source,
+        ...(job.mode === "enlarge"
+          ? {
+              mode: "enlarge",
+              image: job.image,
+              strength: job.strength,
+            }
+          : {}),
+      }),
+      signal: controller.signal,
+    });
+    if (job.cancelled) return "cancelled";
+    if (response.status === 409) {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      if (job.cancelled) return "cancelled";
+      generateQueue.unshift(job);
+      return false;
     }
-  });
-  if (!generated?.filename) throw new Error("Generation ended without an image.");
-  kleinLog("app", "generate-done", { id: job.id, filename: generated.filename, mode: job.mode || "generate" });
-  window.dispatchEvent(
-    new CustomEvent("klein:generate-done", {
-      detail: { id: job.id, image: generated },
-    }),
-  );
-  await finishGeneratedSlot(
-    slots.find((slot) => slot.id === job.slotId) ?? {
-      id: job.slotId,
-      aspect: job.aspect,
-      image: null,
-      status: "idle",
-      error: "",
-    },
-    generated,
-  );
-  return true;
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || "Generation failed.");
+    }
+    await readSseEvents(response, (event) => {
+      if (job.cancelled) return;
+      if (event.type === "preview") {
+        window.dispatchEvent(
+          new CustomEvent("klein:generate-preview", {
+            detail: { id: job.id, url: event.url },
+          }),
+        );
+      } else if (event.type === "progress") {
+        statusEl.textContent = queueStatus(
+          job.aspect,
+          `${event.step}/${event.total}`,
+          job.mode === "enlarge" ? "Enlarging" : "Generating",
+        );
+      } else if (event.type === "status") {
+        statusEl.textContent = event.message || statusEl.textContent;
+      } else if (event.type === "model") {
+        applyModels({
+          klein: {
+            ...models.klein,
+            action: event.action ?? models.klein.action,
+            percent: event.percent ?? models.klein.percent,
+            message: event.message ?? models.klein.message,
+            loaded: event.kleinLoaded ?? models.klein.loaded,
+          },
+          memoryGb: event.memoryGb ?? models.memoryGb,
+        });
+      } else if (event.type === "done") {
+        generated = event.image;
+      } else if (event.type === "error") {
+        throw new Error(event.error || "Generation failed.");
+      }
+    });
+    if (job.cancelled) return "cancelled";
+    if (!generated?.filename) throw new Error("Generation ended without an image.");
+    kleinLog("app", "generate-done", { id: job.id, filename: generated.filename, mode: job.mode || "generate" });
+    trackedJobs.delete(job.id);
+    window.dispatchEvent(
+      new CustomEvent("klein:generate-done", {
+        detail: { id: job.id, image: generated },
+      }),
+    );
+    await finishGeneratedSlot(
+      slots.find((slot) => slot.id === job.slotId) ?? {
+        id: job.slotId,
+        aspect: job.aspect,
+        image: null,
+        status: "idle",
+        error: "",
+      },
+      generated,
+    );
+    return true;
+  } catch (error) {
+    if (job.cancelled || error?.name === "AbortError") return "cancelled";
+    trackedJobs.delete(job.id);
+    throw error;
+  } finally {
+    if (activeGenerate?.job === job) activeGenerate = null;
+  }
 }
 
 async function pumpGenerateQueue() {
@@ -1235,8 +1872,11 @@ async function pumpGenerateQueue() {
   try {
     while (generateQueue.length) {
       const job = generateQueue.shift();
+      if (job.cancelled) continue;
       try {
-        if (await runGenerateJob(job)) queueDone += 1;
+        const result = await runGenerateJob(job);
+        if (result === "cancelled") continue;
+        if (result) queueDone += 1;
       } catch (error) {
         failed += 1;
         queueDone += 1;
@@ -1273,6 +1913,7 @@ async function pumpGenerateQueue() {
 
 function generateBoard() {
   showError("");
+  for (const el of promptEls) promotePromptTokens(el, { includeTrailing: true });
   const subject = subjectText();
   const style = styleText();
   if (!combinePrompt(subject, style)) {
@@ -1293,6 +1934,8 @@ function generateBoard() {
     sampler: resolveSampler(),
     source: selected?.filename,
   };
+  trackJob(job);
+  job.queued = true;
   queueTotal += 1;
   generateQueue.push(job);
   kleinLog("app", "generate-start", { id: job.id, aspect: job.aspect, queued: generateQueue.length });
@@ -1313,9 +1956,8 @@ function generateBoard() {
   pumpGenerateQueue();
 }
 
-function describeTransfer(dataTransfer) {
-  const files = filesFromDataTransfer(dataTransfer);
-  return files[0] || null;
+function describeTransfers(dataTransfer) {
+  return filesFromDataTransfer(dataTransfer).slice(0, COMBINE_MAX_IMAGES);
 }
 
 function bindDescribeBox(box, part) {
@@ -1343,8 +1985,8 @@ function bindDescribeBox(box, part) {
     if (!hasImageFiles(event.dataTransfer)) return;
     event.preventDefault();
     event.stopPropagation();
-    const file = describeTransfer(event.dataTransfer);
-    if (file) describeFromSource({ file }, { part });
+    const files = describeTransfers(event.dataTransfer);
+    if (files.length) describeFromSource(files.map((file) => ({ file })), { part });
     else if (!describing[part]) endEat(box);
   });
 }
@@ -1353,15 +1995,32 @@ bindDescribeBox(subjectBox, "subject");
 bindDescribeBox(styleBox, "style");
 
 for (const el of promptEls) {
-  el.addEventListener("input", () => {
+  el.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || !(event.metaKey || event.ctrlKey) || event.isComposing) return;
+    event.preventDefault();
+    generateBoard();
+  });
+  el.addEventListener("input", (event) => {
+    if (event.isComposing) return;
+    promotePromptTokens(el);
+    if (!fieldText(el)) el.replaceChildren();
+    renderDescribe();
+  });
+  el.addEventListener("compositionend", () => {
+    promotePromptTokens(el);
+    if (!fieldText(el)) el.replaceChildren();
+    renderDescribe();
+  });
+  el.addEventListener("blur", () => {
+    promotePromptTokens(el, { includeTrailing: true });
     if (!fieldText(el)) el.replaceChildren();
     renderDescribe();
   });
   el.addEventListener("paste", (event) => {
     event.preventDefault();
-    const file = describeTransfer(event.clipboardData);
-    if (file) {
-      describeFromSource({ file }, { part: el === styleEl ? "style" : "subject" });
+    const files = describeTransfers(event.clipboardData);
+    if (files.length) {
+      describeFromSource(files.map((file) => ({ file })), { part: el === styleEl ? "style" : "subject" });
       return;
     }
     const text = event.clipboardData?.getData("text/plain") ?? "";
@@ -1369,28 +2028,39 @@ for (const el of promptEls) {
   });
 }
 
+window.addEventListener("klein:cancel-generate", (event) => {
+  cancelGenerateJob(event.detail?.id);
+});
 window.addEventListener("klein:drag-lift", (event) => {
   setDragLift(event.detail);
 });
 window.addEventListener("klein:describe", async (event) => {
-  const image = event.detail?.image;
-  if (!image) return;
+  const list = (
+    Array.isArray(event.detail?.images) && event.detail.images.length
+      ? event.detail.images
+      : event.detail?.image
+        ? [event.detail.image]
+        : []
+  ).filter((image) => image?.url || image?.filename).slice(0, COMBINE_MAX_IMAGES);
+  if (!list.length) return;
   const part = event.detail?.part === "style" ? "style" : "subject";
-  const known = images.find((item) => item.filename === image.filename) ?? image;
+  const known = list.map((image) => images.find((item) => item.filename === image.filename) ?? image);
+  const items = Array.isArray(event.detail?.items) ? event.detail.items : [];
   const box = describeBoxes[part];
-  setDragLift({ on: false });
+  const firstSize = items[0] || event.detail || known[0];
+  setDragLift({ on: false, immediate: true });
   beginEat(box, {
-    url: known.url || event.detail?.url,
-    width: event.detail?.width,
-    height: event.detail?.height,
+    urls: known.map((image, index) => image.url || items[index]?.url).filter(Boolean),
+    width: firstSize.width,
+    height: firstSize.height,
   });
-  if (known.filename) selectImage(known, { restore: false });
+  if (known.length === 1 && known[0].filename) selectImage(known[0], { restore: false });
   describeFromSource(
-    {
-      ...known,
-      width: event.detail?.width,
-      height: event.detail?.height,
-    },
+    known.map((image, index) => ({
+      ...image,
+      width: items[index]?.width ?? image.width,
+      height: items[index]?.height ?? image.height,
+    })),
     { alreadyEating: true, part },
   );
 });
@@ -1406,6 +2076,9 @@ window.addEventListener("klein:describe-hover", (event) => {
   endEat();
 });
 generateBtn.addEventListener("click", generateBoard);
+promptEditForm.addEventListener("submit", submitPromptEdit);
+promptEditEl.addEventListener("mousedown", (event) => event.stopPropagation());
+promptEditEl.addEventListener("click", (event) => event.stopPropagation());
 samplerBtn.addEventListener("click", (event) => {
   event.stopPropagation();
   openSamplerMenu();
@@ -1413,6 +2086,9 @@ samplerBtn.addEventListener("click", (event) => {
 document.addEventListener("click", (event) => {
   if (!ratioMenuEl.hidden && !ratioMenuEl.contains(event.target)) closeRatioMenu();
   if (!imageMenuEl.hidden && !imageMenuEl.contains(event.target)) closeImageMenu();
+  if (!promptEditEl.hidden && !promptEditEl.contains(event.target) && !promptEditEl.dataset.busy) {
+    closePromptEdit();
+  }
   if (
     !samplerMenuEl.hidden &&
     !samplerMenuEl.contains(event.target) &&
@@ -1426,6 +2102,7 @@ window.addEventListener("keydown", (event) => {
     closeRatioMenu();
     closeSamplerMenu();
     closeImageMenu();
+    closePromptEdit();
   }
 });
 window.addEventListener("klein:image-menu", (event) => {
@@ -1448,6 +2125,7 @@ window.addEventListener("resize", () => {
     const rect = samplerBtn.getBoundingClientRect();
     placeOnScreen(samplerMenuEl, rect.right, rect.bottom + 4);
   }
+  if (!promptEditEl.hidden) placePromptEdit();
 });
 
 window.addEventListener("klein:select", (event) => {
@@ -1640,7 +2318,8 @@ const boardPeek = attachEdgePeek({
     promptEls.includes(document.activeElement) ||
     !ratioMenuEl.hidden ||
     !samplerMenuEl.hidden ||
-    !imageMenuEl.hidden,
+    !imageMenuEl.hidden ||
+    !promptEditEl.hidden,
 });
 
 for (const el of promptEls) {

@@ -14,6 +14,7 @@ import {
   centerOrigin,
   findFreePosition,
   masonryLayout,
+  nodeHeight,
   nodeWidth,
   occupiedBoxes,
 } from "./placement.js";
@@ -23,6 +24,11 @@ import { kleinLog, nodeIds } from "../debugLog.js";
 const DEFAULT_VIEWPORT = { x: 0, y: 0, zoom: 1 };
 const EXIT_MS = 280;
 const GRID_MS = 520;
+const FOCUS_MS = 720;
+const MIN_ZOOM = 0.1;
+const MAX_ZOOM = 2;
+const MIN_NODE_SCREEN = 180;
+const TARGET_NODE_SCREEN = 240;
 
 function easeOutQuart(t) {
   return 1 - (1 - t) ** 4;
@@ -218,7 +224,7 @@ function toNode(image, position, extra = {}) {
     position,
     data: { image, ...extra },
     style: { width: nodeWidth(image) },
-    deletable: extra.generating ? false : true,
+    deletable: true,
   };
 }
 
@@ -240,7 +246,7 @@ function toGeneratingNode(slot, position) {
       image,
     },
     style: { width: nodeWidth(image) },
-    deletable: false,
+    deletable: true,
   };
 }
 
@@ -267,6 +273,8 @@ export function ImageCanvas() {
   const hydratedRef = useRef(false);
   const describeDropOriginRef = useRef(null);
   const dragSessionRef = useRef({ mode: null, ids: [] });
+  const liftEpochRef = useRef(0);
+  const pendingLiftClearRef = useRef(null);
   const reflowRef = useRef({ gen: 0, raf: 0 });
   nodesRef.current = nodes;
 
@@ -316,6 +324,49 @@ export function ImageCanvas() {
     const y = rect ? rect.top + rect.height / 2 : window.innerHeight / 2;
     return screenToFlowPosition({ x, y });
   }, [screenToFlowPosition]);
+
+  const focusFrame = useCallback(
+    (image, position) => {
+      const rect = paneRef.current?.getBoundingClientRect();
+      if (!rect || !image || !position) return;
+      const board =
+        Number.parseFloat(
+          getComputedStyle(document.documentElement).getPropertyValue("--board-width"),
+        ) || 372;
+      const centerX = Math.max(120, (rect.width - board) / 2);
+      const centerY = rect.height / 2;
+      const width = nodeWidth(image);
+      const height = nodeHeight(image);
+      const current = viewportRef.current;
+      const currentZoom = current.zoom || 1;
+      const short = Math.min(width, height);
+      const visibleW = Math.max(160, rect.width - board);
+      const fitZoom = Math.min((visibleW - 80) / width, (rect.height - 80) / height, MAX_ZOOM);
+      let zoom = currentZoom;
+      if (short * currentZoom < MIN_NODE_SCREEN) {
+        const targetScreen = Math.min(TARGET_NODE_SCREEN, Math.min(visibleW, rect.height) * 0.36);
+        zoom = Math.min(MAX_ZOOM, fitZoom, Math.max(currentZoom, targetScreen / short));
+      }
+      zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
+      const next = {
+        x: centerX - (position.x + width / 2) * zoom,
+        y: centerY - (position.y + height / 2) * zoom,
+        zoom,
+      };
+      if (
+        Math.abs(current.x - next.x) < 2 &&
+        Math.abs(current.y - next.y) < 2 &&
+        Math.abs(current.zoom - next.zoom) < 0.01
+      ) {
+        return;
+      }
+      setViewport(next, {
+        duration: prefersReducedMotion() ? 0 : FOCUS_MS,
+        ease: easeOutQuart,
+      });
+    },
+    [setViewport],
+  );
 
   const placeImage = useCallback(
     (image, preferred) => {
@@ -387,7 +438,7 @@ export function ImageCanvas() {
   );
 
   const latestRef = useRef({});
-  latestRef.current = { placeImage, persistLayout, syncFolder, visibleCenter };
+  latestRef.current = { placeImage, persistLayout, syncFolder, visibleCenter, focusFrame };
 
   useEffect(() => {
     let ignore = false;
@@ -451,6 +502,7 @@ export function ImageCanvas() {
       const origin = latestRef.current.visibleCenter();
       if (!besideId && !batchRef.current) batchRef.current = { origin, count: 0 };
       kleinLog("canvas", "generate-start", { ids: slots.map((slot) => slot.id), beside: besideId || null });
+      let focus = null;
       setNodes((current) => {
         const next = [...current];
         const beside = besideId ? next.find((node) => node.id === besideId) : null;
@@ -481,9 +533,11 @@ export function ImageCanvas() {
             batchRef.current.origin = packOrigin;
           }
           next.push(toGeneratingNode(slot, position));
+          focus = { image: stub, position };
         });
         return next;
       });
+      if (focus) latestRef.current.focusFrame(focus.image, focus.position);
     };
     const patchGenerating = (slotId, patch) => {
       if (slotId == null) return;
@@ -600,20 +654,30 @@ export function ImageCanvas() {
     );
   };
 
-  const clearLifting = (ids) => {
-    setNodes((current) =>
-      current.map((item) => {
-        const next = withoutNodeClass(item, "lifting");
-        return ids.has(item.id) ? { ...next, zIndex: undefined } : next;
-      }),
-    );
-  };
+  useEffect(() => {
+    const onLiftSettled = () => {
+      const pending = pendingLiftClearRef.current;
+      pendingLiftClearRef.current = null;
+      if (!pending || pending.epoch !== liftEpochRef.current) return;
+      const ids = pending.ids;
+      setNodes((current) =>
+        current.map((item) => {
+          const next = withoutNodeClass(item, "lifting");
+          return ids.has(item.id) ? { ...next, zIndex: undefined } : next;
+        }),
+      );
+    };
+    window.addEventListener("klein:drag-lift-settled", onLiftSettled);
+    return () => window.removeEventListener("klein:drag-lift-settled", onLiftSettled);
+  }, [setNodes]);
 
   const startSingleDrag = (event, node) => {
     describeDropOriginRef.current = { id: node.id, position: { ...node.position } };
+    liftEpochRef.current += 1;
+    pendingLiftClearRef.current = null;
+    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: liftSingleDetail(node) }));
     markLifting(new Set([node.id]), { zIndex: 1000 });
     smoothDragRef.current.onDragStart(event, node);
-    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: liftSingleDetail(node) }));
   };
 
   const moveSingleDrag = (event, node) => {
@@ -629,7 +693,6 @@ export function ImageCanvas() {
   const stopSingleDrag = (event, node) => {
     const origin = describeDropOriginRef.current;
     describeDropOriginRef.current = null;
-    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: { on: false } }));
     const part = describePartFromPoint(event);
     const dropped =
       Boolean(part) &&
@@ -637,6 +700,9 @@ export function ImageCanvas() {
       !node.data?.generating &&
       !node.data?.exiting;
     if (dropped && origin?.id === node.id) {
+      liftEpochRef.current += 1;
+      pendingLiftClearRef.current = null;
+      window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: { on: false, immediate: true } }));
       const size = liftItem(node);
       smoothDragRef.current.cancelActive?.();
       setNodes((current) =>
@@ -659,26 +725,72 @@ export function ImageCanvas() {
       );
       return;
     }
-    clearLifting(new Set([node.id]));
+    pendingLiftClearRef.current = { epoch: liftEpochRef.current, ids: new Set([node.id]) };
+    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: { on: false } }));
     window.dispatchEvent(new CustomEvent("klein:describe-hover", { detail: { on: false } }));
     smoothDragRef.current.onDragStop(event, node);
     persistLayout();
   };
 
   const startGroupDrag = (group) => {
+    describeDropOriginRef.current = group.map((item) => ({
+      id: item.id,
+      position: { ...item.position },
+    }));
+    liftEpochRef.current += 1;
+    pendingLiftClearRef.current = null;
+    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: liftGroupDetail(group) }));
+    markLifting(new Set(group.map((item) => item.id)));
+  };
+
+  const moveGroupDrag = (event, group) => {
+    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: liftGroupDetail(group) }));
+    window.dispatchEvent(
+      new CustomEvent("klein:describe-hover", {
+        detail: describePointerDetail(group[0], describePartFromPoint(event)),
+      }),
+    );
+  };
+
+  const stopGroupDrag = (event, group) => {
+    const origins = Array.isArray(describeDropOriginRef.current) ? describeDropOriginRef.current : [];
     describeDropOriginRef.current = null;
-    const ids = new Set(group.map((item) => item.id));
-    markLifting(ids);
-    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: liftGroupDetail(group) }));
-  };
-
-  const moveGroupDrag = (group) => {
-    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: liftGroupDetail(group) }));
-  };
-
-  const stopGroupDrag = (group) => {
+    const originById = new Map(origins.map((item) => [item.id, item.position]));
+    const part = describePartFromPoint(event);
+    const sources = group.filter(
+      (item) => item.data?.image?.url && !item.data?.generating && !item.data?.exiting,
+    );
+    const dropped = Boolean(part) && sources.length >= 1;
+    if (dropped) {
+      liftEpochRef.current += 1;
+      pendingLiftClearRef.current = null;
+      window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: { on: false, immediate: true } }));
+      window.dispatchEvent(new CustomEvent("klein:describe-hover", { detail: { on: false } }));
+      setNodes((current) =>
+        current.map((item) => {
+          const origin = originById.get(item.id);
+          const next = withoutNodeClass(item, "lifting");
+          return origin ? { ...next, position: origin, zIndex: undefined } : next;
+        }),
+      );
+      const picked = sources.slice(0, 4);
+      window.dispatchEvent(
+        new CustomEvent("klein:describe", {
+          detail: {
+            images: picked.map((item) => item.data.image),
+            items: picked.map(liftItem),
+            part,
+          },
+        }),
+      );
+      return;
+    }
+    pendingLiftClearRef.current = {
+      epoch: liftEpochRef.current,
+      ids: new Set(group.map((item) => item.id)),
+    };
     window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: { on: false } }));
-    clearLifting(new Set(group.map((item) => item.id)));
+    window.dispatchEvent(new CustomEvent("klein:describe-hover", { detail: { on: false } }));
     persistLayout();
   };
 
@@ -693,7 +805,7 @@ export function ImageCanvas() {
 
   const onNodeDrag = useCallback((event, node, nodes) => {
     if (dragSessionRef.current.mode === "group") {
-      moveGroupDrag(nodesForDrag(node, nodes, nodesRef.current));
+      moveGroupDrag(event, nodesForDrag(node, nodes, nodesRef.current));
       return;
     }
     moveSingleDrag(event, node);
@@ -703,7 +815,7 @@ export function ImageCanvas() {
     const mode = dragSessionRef.current.mode;
     dragSessionRef.current = { mode: null, ids: [] };
     if (mode === "group") {
-      stopGroupDrag(nodesForDrag(node, nodes, nodesRef.current));
+      stopGroupDrag(event, nodesForDrag(node, nodes, nodesRef.current));
       return;
     }
     stopSingleDrag(event, node);
@@ -855,9 +967,21 @@ export function ImageCanvas() {
   }, [deleteElements, persistLayout, setNodes, stopReflow]);
 
   const onBeforeDelete = useCallback(async ({ nodes: doomed }) => {
+    const generating = doomed.filter((node) => node.data?.generating);
     const removable = doomed.filter((node) => !node.data?.generating && node.data?.image?.filename);
-    kleinLog("canvas", "before-delete", { doomed: doomed.map((node) => node.id), removable: removable.map((node) => node.id) });
-    if (!removable.length) return false;
+    kleinLog("canvas", "before-delete", {
+      doomed: doomed.map((node) => node.id),
+      generating: generating.map((node) => node.id),
+      removable: removable.map((node) => node.id),
+    });
+    for (const node of generating) {
+      window.dispatchEvent(
+        new CustomEvent("klein:cancel-generate", {
+          detail: { id: node.data?.slotId || String(node.id).replace(/^gen:/, "") },
+        }),
+      );
+    }
+    if (!removable.length) return generating.length ? { nodes: generating, edges: [] } : false;
     const ids = new Set(removable.map((node) => node.id));
     setNodes((current) =>
       current.map((node) =>
@@ -887,7 +1011,7 @@ export function ImageCanvas() {
           }
         }),
       );
-      return { nodes: removable, edges: [] };
+      return { nodes: [...removable, ...generating], edges: [] };
     } catch (error) {
       setNodes((current) =>
         current.map((node) =>
@@ -903,7 +1027,7 @@ export function ImageCanvas() {
         ),
       );
       window.dispatchEvent(new CustomEvent("klein:error", { detail: { message: error.message } }));
-      return false;
+      return generating.length ? { nodes: generating, edges: [] } : false;
     }
   }, [setNodes]);
 
