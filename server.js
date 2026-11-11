@@ -9,6 +9,8 @@ import os from "node:os";
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
+import { textLlm, TEXT_MODEL_ID } from "./src/localLlm.js";
+import { createJobQueue } from "./src/jobQueue.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GENERATED_DIR = path.join(__dirname, "generated");
@@ -23,33 +25,48 @@ const HF_HOME = process.env.HF_HOME ?? path.join(__dirname, ".hf-cache");
 
 const MODEL = process.env.DRAWTHINGS_MODEL ?? "flux_2_klein_4b_q8p.ckpt";
 const FAL_VISION_URL = "https://fal.run/fal-ai/any-llm/vision";
-const FAL_LLM_URL = "https://fal.run/fal-ai/any-llm";
 const FAL_DESCRIBE_MODEL = process.env.FAL_DESCRIBE_MODEL ?? "openai/gpt-5-mini";
 const REVISE_SYSTEM_PROMPT =
   "You rewrite text-to-image prompts. Apply the user's change to the original subject and style. " +
   "Keep everything that is not changed. Subject is who or what is depicted and how they are posed. " +
-  "Style is medium, palette, light, and mood only. Preserve {random} and {random_color} tokens if they still apply. " +
+  "Style is medium, palette, light, and mood only. " +
   'Reply with JSON only: {"subject":"...","style":"..."}';
 const SHUFFLE_SYSTEM_PROMPT =
-  "You rewrite text-to-image prompts. Invent ONE interesting change with no user direction. " +
-  "Choose freely among proportion, color, size, adding something, removing something, a pose shift, a new object, or another surprising twist. " +
-  "Keep the scene recognizable. Do not merely rephrase. Do not explain the change. " +
+  "You shuffle a text-to-image prompt. Keep the same main subject identity. " +
+  "Rewrite the original subject and style so they include the requested change, and nothing else. " +
+  "Do not replace the subject with a different person, animal, or object. " +
+  "Do not add unrelated props. Do not explain. " +
   "Subject is who or what is depicted and how they are posed. Style is medium, palette, light, and mood only. " +
-  "Preserve {random} and {random_color} tokens if they still apply. " +
   'Reply with JSON only: {"subject":"...","style":"..."}';
+const SHUFFLE_CHANGES = [
+  "make the subject unusually tall and skinny",
+  "make the subject squat, wide, and heavy",
+  "make the subject tiny in a large empty space",
+  "make the subject huge, filling the frame",
+  "show two of the same subject side by side",
+  "show a small group of the same subject",
+  "show the subject in strict profile",
+  "show the subject from behind",
+  "tight crop so the subject fills the frame and edges are cut off",
+  "wide shot with lots of empty space around the subject",
+  "shift the palette to cold blue-gray",
+  "shift the palette to saturated warm reds",
+  "light it with a single harsh side light and deep shadow",
+  "light it with flat overcast daylight",
+  "change the medium to a charcoal drawing",
+  "change the medium to a glossy 3D render",
+];
 const CLOSEUP_SYSTEM_PROMPT =
   "You rewrite text-to-image prompts as a close-up of the original scene. " +
   "Move in much closer on the main subject so it fills the frame. Describe the crop: what is now visible, what is cut off, scale, and how the subject sits in the shot. " +
   "Keep identity and style. Do not pull back to a wide shot. Do not merely prepend close-up of. Do not mention camera bodies or focal lengths. " +
   "Subject is who or what is depicted and how they are posed. Style is medium, palette, light, and mood only. " +
-  "Preserve {random} and {random_color} tokens if they still apply. " +
   'Reply with JSON only: {"subject":"...","style":"..."}';
 const TWIN_SYSTEM_PROMPT =
   "You rewrite text-to-image prompts using different words for the same scene. " +
   "Keep the subject, pose, setting, and style. Swap phrasing, synonyms, and sentence shape so it is not a copy. " +
   "Do not add new objects, remove things, or change colors, scale, or camera distance. " +
   "Subject is who or what is depicted and how they are posed. Style is medium, palette, light, and mood only. " +
-  "Preserve {random} and {random_color} tokens if they still apply. " +
   'Reply with JSON only: {"subject":"...","style":"..."}';
 const DESCRIBE_SUBJECT_PROMPT =
   "Write a dense text-to-image prompt for ONLY the subject and positioning, at least 25 words. " +
@@ -371,35 +388,83 @@ async function imageToFalDataUrl(filePath) {
   return bufferToFalJpegDataUrl(buf, path.extname(filePath).toLowerCase() || ".png");
 }
 
-async function falText(prompt, systemPrompt = REVISE_SYSTEM_PROMPT, { temperature = 0.4 } = {}) {
-  const key = falKey();
-  if (!key) throw new Error("Missing FALKEY. Add it to .env to revise prompts.");
-  const response = await fetch(FAL_LLM_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Key ${key}`,
-      "Content-Type": "application/json",
+function logModelCall(source, model, action) {
+  console.log(`[model] ${source} ${model} · ${action}`);
+}
+
+const REWRITE_ACTIONS = {
+  revise: {
+    systemPrompt: REVISE_SYSTEM_PROMPT,
+    temperature: 0.4,
+    instruction: (job) => `Change:\n${job.rewrite?.change || ""}`,
+  },
+  shuffle: {
+    systemPrompt: SHUFFLE_SYSTEM_PROMPT,
+    temperature: 0.6,
+    instruction: () => {
+      const change = SHUFFLE_CHANGES[Math.floor(Math.random() * SHUFFLE_CHANGES.length)];
+      return `Requested change: ${change}. Keep the same subject.`;
     },
-    body: JSON.stringify({
-      prompt,
-      system_prompt: systemPrompt,
-      model: FAL_DESCRIBE_MODEL,
-      reasoning: true,
-      priority: "latency",
+  },
+  closeup: {
+    systemPrompt: CLOSEUP_SYSTEM_PROMPT,
+    temperature: 0.5,
+    instruction: () => "Rewrite as a close-up shot of this scene.",
+  },
+  twin: {
+    systemPrompt: TWIN_SYSTEM_PROMPT,
+    temperature: 0.7,
+    instruction: () => "Rewrite with different words. Keep the same scene.",
+  },
+};
+
+async function localText(prompt, systemPrompt = REVISE_SYSTEM_PROMPT, { temperature = 0.4, action = "text" } = {}) {
+  logModelCall("local", TEXT_MODEL_ID, action);
+  const text = cleanDescribeText(
+    await textLlm.complete({
+      systemPrompt,
+      userPrompt: prompt,
       temperature,
     }),
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(falErrorMessage(payload, response.status));
-  const data = payload?.data ?? payload;
-  const text = cleanDescribeText(data?.output);
-  if (!text) throw new Error("fal returned an empty prompt.");
+  );
+  if (!text) throw new Error("The local text model returned an empty prompt.");
   return text;
+}
+
+async function rewriteQueuedJob(job) {
+  const spec = REWRITE_ACTIONS[job.rewrite?.action];
+  if (!spec) throw new Error(`Unknown rewrite action: ${job.rewrite?.action || "none"}`);
+  const stored = await originalPromptForRevise(
+    job.rewrite.filename,
+    job.rewrite.subject,
+    job.rewrite.style,
+  );
+  const original = expandPromptParts(stored.subject, stored.style);
+  const output = await localText(
+    [
+      "Original subject:",
+      original.subject || "(none)",
+      "",
+      "Original style:",
+      original.style || "(none)",
+      "",
+      spec.instruction(job),
+    ].join("\n"),
+    spec.systemPrompt,
+    { temperature: spec.temperature, action: job.rewrite.action },
+  );
+  const parsed = parseRevisedPrompt(output);
+  const revised = expandPromptParts(parsed.subject, parsed.style);
+  if (!combinePrompt(revised.subject, revised.style)) {
+    throw new Error("The revised prompt was empty.");
+  }
+  return revised;
 }
 
 function parseRevisedPrompt(text) {
   const cleaned = cleanDescribeText(text);
-  const start = cleaned.indexOf("{");
+  const tagged = cleaned.search(/\{[\s\n]*"(?:subject|style|prompt)"/);
+  const start = tagged >= 0 ? tagged : cleaned.indexOf("{");
   const end = cleaned.lastIndexOf("}");
   if (start >= 0 && end > start) {
     try {
@@ -422,31 +487,16 @@ async function originalPromptForRevise(filename, subject, style) {
     if (!nextSubject) nextSubject = await rememberedPart(filename, "subject");
     if (!nextStyle) nextStyle = await rememberedPart(filename, "style");
   }
-  const filePath = resolveExistingFile(filename);
-  const missing = [];
-  if (!nextSubject) missing.push("subject");
-  if (!nextStyle) missing.push("style");
-  if (missing.length && filePath) {
-    const described = await Promise.all(
-      missing.map((part) => describeWithFal({ filePath, part })),
-    );
-    for (const part of described) {
-      if (part.subject) nextSubject = part.subject;
-      if (part.style) nextStyle = part.style;
-    }
-    if (filename && (nextSubject || nextStyle)) {
-      await rememberImageDescription(filename, { subject: nextSubject, style: nextStyle });
-    }
-  }
   if (!nextSubject && !nextStyle) {
-    throw new Error("This image has no prompt to revise.");
+    throw new Error("This image has no stored prompt. Describe it first, then try again.");
   }
   return { subject: nextSubject, style: nextStyle };
 }
 
-async function falVision(imageUrls, prompt, { temperature = 0.3 } = {}) {
+async function falVision(imageUrls, prompt, { temperature = 0.3, action = "describe" } = {}) {
   const key = falKey();
   if (!key) throw new Error("Missing FALKEY. Add it to .env to describe images.");
+  logModelCall("fal", FAL_DESCRIBE_MODEL, action);
   const urls = (Array.isArray(imageUrls) ? imageUrls : [imageUrls]).filter(Boolean);
   if (!urls.length) throw new Error("Drop an image onto the prompt to describe it.");
   const response = await fetch(FAL_VISION_URL, {
@@ -501,7 +551,10 @@ async function describeWithFal({ filePath, dataUrl, images, part }) {
       : task === "style"
         ? DESCRIBE_STYLE_PROMPT
         : DESCRIBE_SUBJECT_PROMPT,
-    { temperature: combine ? 0.55 : 0.3 },
+    {
+      temperature: combine ? 0.55 : 0.3,
+      action: combine ? `describe-combine-${task}` : `describe-${task}`,
+    },
   );
   return { [task]: text };
 }
@@ -546,7 +599,6 @@ function combinePrompt(subject, style) {
   return [subject, style].map((part) => String(part ?? "").trim()).filter(Boolean).join("\n\n");
 }
 
-const PROMPT_TOKEN_RE = /\{random_color\}|\{random\}/gi;
 const RANDOM_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const HTML_COLOR_NAMES = [
   "alice blue",
@@ -705,9 +757,16 @@ function randomHtmlColorName() {
 }
 
 function expandRandomTokens(text) {
-  return String(text ?? "").replace(PROMPT_TOKEN_RE, (token) =>
+  return String(text ?? "").replace(/\{random_color\}|\{random\}/gi, (token) =>
     token.toLowerCase() === "{random_color}" ? randomHtmlColorName() : randomTokenValue(),
   );
+}
+
+function expandPromptParts(subject, style) {
+  return {
+    subject: expandRandomTokens(subject),
+    style: expandRandomTokens(style),
+  };
 }
 
 async function rememberedPart(filename, part) {
@@ -864,9 +923,12 @@ async function refreshKleinAvailability() {
   return present;
 }
 
-function releaseMlxForGenerate() {
-  if (!worker.alive) return Promise.resolve();
-  return worker
+async function releaseLocalModelsForGenerate() {
+  await textLlm.unload().catch((error) => {
+    console.warn(`[text-llm] unload: ${error.message || error}`);
+  });
+  if (!worker.alive) return;
+  await worker
     .request({ op: "unload", model: "all" })
     .catch(() => {})
     .finally(() => {
@@ -1205,10 +1267,297 @@ function resolveExistingFile(filename) {
   return path.join(GENERATED_DIR, base);
 }
 
+function openSse(res) {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+  const abort = new AbortController();
+  res.on("close", () => {
+    if (!res.writableEnded) abort.abort();
+  });
+  const send = (event) => {
+    if (res.writableEnded) return;
+    res.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
+  return { send, abort };
+}
+
+async function runKleinGenerate(job) {
+  const {
+    subject,
+    style,
+    steps,
+    sampler,
+    aspect,
+    width,
+    height,
+    seed,
+    filename,
+    outputPath,
+    previewName,
+    previewPath,
+    promptPath,
+    initPath,
+    initResizedPath,
+    strength,
+    source,
+    abort,
+    send,
+  } = job;
+  const expanded = expandPromptParts(subject, style);
+  const prompt = combinePrompt(expanded.subject, expanded.style) || (initPath ? ENLARGE_PROMPT : "");
+  if (!prompt) throw new Error("Add a subject or style first.");
+  if (expanded.subject !== (subject ?? "") || expanded.style !== (style ?? "")) {
+    console.log(`[klein generate] tokens → ${prompt}`);
+  }
+  if (!(await refreshKleinAvailability())) {
+    throw new Error(`${MODEL} is not downloaded.`);
+  }
+  send({ type: "status", message: initPath ? "Enlarging with Draw Things" : "Generating with Draw Things" });
+  await releaseLocalModelsForGenerate();
+  busy = true;
+  setKleinState({ loaded: true, action: "load", percent: 4, message: "Draw Things" });
+  await fs.writeFile(promptPath, prompt);
+  if (initPath) {
+    await lanczosResize(initPath, initResizedPath, width, height);
+    await fs.copyFile(initResizedPath, previewPath);
+    send({ type: "preview", url: `/preview/${previewName}?t=${Date.now()}` });
+    send({ type: "progress", step: 0, total: steps });
+  }
+  try {
+    await generateWithLivePreview({
+      args: [
+        "generate",
+        "--model",
+        MODEL,
+        "--prompt-file",
+        promptPath,
+        "--width",
+        String(width),
+        "--height",
+        String(height),
+        "--steps",
+        String(steps),
+        "--seed",
+        String(seed),
+        ...(initPath ? ["--image", initResizedPath, "--strength", String(strength)] : []),
+        "--config-json",
+        JSON.stringify({ sampler: sampler.id }),
+      ],
+      outputPath,
+      previewPath,
+      onPreview: () => {
+        send({ type: "preview", url: `/preview/${previewName}?t=${Date.now()}` });
+      },
+      onProgress: ({ step, total }) => {
+        const percent = Math.max(4, Math.round((step / total) * 100));
+        setKleinState({ loaded: true, action: "load", percent, message: "Draw Things" });
+        send({ type: "progress", step, total });
+        send({
+          type: "model",
+          model: "klein",
+          action: "load",
+          percent,
+          message: "Draw Things",
+          kleinLoaded: true,
+        });
+      },
+      signal: abort.signal,
+    });
+    if (abort.signal.aborted || job.cancelled) throw cancelledError();
+    const entry = {
+      filename,
+      subject: expanded.subject,
+      style: expanded.style,
+      seed,
+      steps,
+      sampler: sampler.id,
+      aspect,
+      createdAt: new Date().toISOString(),
+      width,
+      height,
+      scale: initPath ? 2 : 1,
+      strength: strength ?? null,
+      model: MODEL,
+      source: initPath ? path.basename(initPath) : source ? path.basename(String(source)) : null,
+    };
+    const manifest = await readManifest();
+    manifest.push(entry);
+    await writeManifest(manifest);
+    setKleinState({ loaded: true, action: "idle", percent: 100, message: "Draw Things" });
+    console.log(`[klein generate] wrote ${filename} ${width}x${height}`);
+    send({
+      type: "done",
+      image: { ...entry, url: `/generated/${encodeURIComponent(filename)}` },
+    });
+    job.res.end();
+  } finally {
+    await fs.unlink(promptPath).catch(() => {});
+    await fs.unlink(previewPath).catch(() => {});
+    if (initResizedPath) await fs.unlink(initResizedPath).catch(() => {});
+    await refreshKleinAvailability();
+  }
+}
+
+const jobQueue = createJobQueue({
+  log: (message) => console.log(message),
+  async unloadText() {
+    await releaseLocalModelsForGenerate();
+  },
+  async onIdle() {
+    busy = jobQueue.isBusy();
+    await releaseLocalModelsForGenerate();
+    await refreshKleinAvailability().catch(() => {});
+  },
+  async rewriteJobs(jobs) {
+    busy = true;
+    await textLlm.load();
+    for (const job of jobs) {
+      if (job.cancelled) continue;
+      job.send({ type: "status", message: `Rewriting with ${TEXT_MODEL_ID}` });
+      try {
+        const revised = await rewriteQueuedJob(job);
+        if (job.cancelled) continue;
+        job.subject = revised.subject;
+        job.style = revised.style;
+        job.stage = "generate";
+        job.send({ type: "status", message: "Prompt ready. Waiting for Klein…" });
+      } catch (error) {
+        job.stage = "done";
+        job.send({
+          type: "error",
+          error: job.cancelled ? "Generation cancelled." : publicError(error),
+        });
+        job.res.end();
+      }
+    }
+    await textLlm.unload();
+  },
+  async generateJob(job) {
+    if (job.cancelled) throw cancelledError();
+    busy = true;
+    try {
+      await runKleinGenerate(job);
+    } catch (error) {
+      await fs.unlink(job.outputPath).catch(() => {});
+      throw error;
+    }
+  },
+});
+
+async function enqueueStudioJob(req, res, { rewrite = null, action = "generate" } = {}) {
+  req.setTimeout(0);
+  const rewriteAction = rewrite?.action ? String(rewrite.action) : "";
+  if (rewriteAction && !REWRITE_ACTIONS[rewriteAction]) {
+    res.status(400).json({ error: "Unknown rewrite action." });
+    return;
+  }
+  const subject = String(req.body?.subject ?? rewrite?.subject ?? "").trim();
+  const style = String(req.body?.style ?? rewrite?.style ?? "").trim();
+  const mode = String(req.body?.mode ?? "");
+  const initPath = mode === "enlarge" ? resolveExistingFile(req.body?.image) : null;
+  const aspect = String(req.body?.aspect ?? "1:1");
+  const ratio = findRatio(aspect);
+  if (mode === "enlarge" && !initPath) {
+    res.status(400).json({ error: "Enlarge needs a source image." });
+    return;
+  }
+  if (!initPath && !ratio) {
+    res.status(400).json({ error: "Unknown aspect ratio." });
+    return;
+  }
+  if (!rewriteAction && !combinePrompt(subject, style) && !initPath) {
+    res.status(400).json({ error: "Add a subject or style first." });
+    return;
+  }
+  const steps = Number(req.body?.steps ?? 4);
+  if (steps !== 2 && steps !== 4) {
+    res.status(400).json({ error: "Steps must be 2 or 4." });
+    return;
+  }
+  const sampler = findSampler(req.body?.sampler) ?? findSampler(DEFAULT_SAMPLER);
+  const strength = initPath
+    ? Math.min(1, Math.max(0.05, Number(req.body?.strength ?? ENLARGE_STRENGTH) || ENLARGE_STRENGTH))
+    : null;
+  let width;
+  let height;
+  if (initPath) {
+    const original = await imageSize(initPath);
+    const sized = sizeForShortSide(original.width, original.height, ENLARGE_SHORT_SIDE);
+    width = sized.width;
+    height = sized.height;
+  } else {
+    ({ width, height } = sizeForRatio(ratio));
+  }
+  const seed = Math.floor(Math.random() * 2 ** 31);
+  const filename = `${timestamp()}-${aspect.replace(":", "x")}-${seed}.png`;
+  const outputPath = path.join(GENERATED_DIR, filename);
+  const previewName = `${seed}.png`;
+  const previewPath = path.join(PREVIEW_DIR, previewName);
+  const promptPath = path.join(PREVIEW_DIR, `${seed}.txt`);
+  const initResizedPath = initPath ? path.join(PREVIEW_DIR, `${seed}-init.png`) : "";
+  await ensureDirs();
+  const { send, abort } = openSse(res);
+  const job = {
+    id: String(req.body?.id || randomUUID()),
+    clientId: String(req.body?.id || ""),
+    action: rewriteAction || (initPath ? "enlarge" : action),
+    stage: rewriteAction ? "rewrite" : "generate",
+    rewrite: rewriteAction
+      ? {
+          action: rewriteAction,
+          filename: String(rewrite.filename || req.body?.filename || ""),
+          subject,
+          style,
+          change: String(rewrite.change || req.body?.change || "").trim(),
+        }
+      : null,
+    subject,
+    style,
+    steps,
+    sampler,
+    aspect,
+    width,
+    height,
+    seed,
+    filename,
+    outputPath,
+    previewName,
+    previewPath,
+    promptPath,
+    initPath,
+    initResizedPath,
+    strength,
+    source: req.body?.source || rewrite?.filename || "",
+    abort,
+    send,
+    res,
+    cancelled: false,
+  };
+  abort.signal.addEventListener(
+    "abort",
+    () => {
+      job.cancelled = true;
+      jobQueue.cancel(job.id);
+    },
+    { once: true },
+  );
+  send({ type: "start", previewUrl: `/preview/${previewName}` });
+  send({
+    type: "status",
+    message: job.stage === "rewrite" ? "Queued for prompt rewrite" : "Queued for Klein",
+  });
+  busy = true;
+  jobQueue.enqueue(job);
+}
+
 app.get("/api/config", (_req, res) => {
   res.json({
     model: MODEL,
     describeModel: FAL_DESCRIBE_MODEL,
+    textModel: TEXT_MODEL_ID,
     shortSide: SHORT_SIDE,
     minSlots: MIN_SLOTS,
     maxSlots: MAX_SLOTS,
@@ -1218,7 +1567,8 @@ app.get("/api/config", (_req, res) => {
     ratios: ratiosWithSizes(),
     mlx: false,
     drawThings: true,
-    busy,
+    busy: jobQueue.isBusy(),
+    queue: jobQueue.snapshot(),
   });
 });
 
@@ -1231,6 +1581,7 @@ app.get("/api/health", async (_req, res) => {
       mlx: false,
       model: MODEL,
       describeModel: FAL_DESCRIBE_MODEL,
+      textModel: TEXT_MODEL_ID,
       error: `${MODEL} is not downloaded. Run draw-things-cli models ensure --model ${MODEL}`,
       models: publicModelState(),
     });
@@ -1242,7 +1593,11 @@ app.get("/api/health", async (_req, res) => {
     mlx: worker.ready,
     model: MODEL,
     describeModel: FAL_DESCRIBE_MODEL,
+    textModel: TEXT_MODEL_ID,
+    textLoaded: textLlm.loaded,
     kleinLoaded: modelState.klein.loaded,
+    busy: jobQueue.isBusy(),
+    queue: jobQueue.snapshot(),
     models: publicModelState(),
   });
 });
@@ -1272,6 +1627,10 @@ app.post("/api/debug-log", async (req, res) => {
     message: String(req.body?.message ?? ""),
     data: req.body?.data ?? null,
   };
+  if (entry.source === "canvas" && entry.message === "sync") {
+    res.json({ ok: true });
+    return;
+  }
   const line = `${JSON.stringify(entry)}\n`;
   await fs.appendFile(DEBUG_LOG_PATH, line).catch(() => {});
   console.log(`[klein ${entry.source}] ${entry.message}${entry.data != null ? ` ${JSON.stringify(entry.data)}` : ""}`);
@@ -1349,11 +1708,12 @@ app.post("/api/models/unload", async (req, res) => {
     res.status(400).json({ error: "Unload klein or all." });
     return;
   }
-  if (busy) {
+  if (jobQueue.isBusy()) {
     res.status(409).json({ error: "Cannot unload while generating." });
     return;
   }
   try {
+    if (which === "all") await textLlm.unload();
     if (worker.alive) {
       const result = await worker.request({ op: "unload", model: which });
       applyModelEvent(result);
@@ -1449,6 +1809,7 @@ app.post("/api/describe", async (req, res) => {
       const item = items[0];
       const stored = item.filename ? await rememberedPart(item.filename, part) : "";
       if (stored) {
+        console.log(`[model] cache stored-${part} · describe-${part}`);
         res.json({ [part]: stored, model: FAL_DESCRIBE_MODEL, cached: true });
         return;
       }
@@ -1469,6 +1830,7 @@ app.post("/api/describe", async (req, res) => {
     });
     res.json({ ...described, model: FAL_DESCRIBE_MODEL, combined: items.length });
   } catch (error) {
+    console.error(`[model] describe failed: ${publicError(error)}`);
     res.status(500).json({ error: publicError(error) });
   }
 });
@@ -1479,267 +1841,50 @@ app.post("/api/revise", async (req, res) => {
     res.status(400).json({ error: "Add a change, like “make it red”." });
     return;
   }
-  try {
-    const original = await originalPromptForRevise(
-      req.body?.filename,
-      req.body?.subject,
-      req.body?.style,
-    );
-    const output = await falText(
-      [
-        "Original subject:",
-        original.subject || "(none)",
-        "",
-        "Original style:",
-        original.style || "(none)",
-        "",
-        "Change:",
-        change,
-      ].join("\n"),
-    );
-    const revised = parseRevisedPrompt(output);
-    res.json({ ...revised, model: FAL_DESCRIBE_MODEL });
-  } catch (error) {
-    res.status(500).json({ error: publicError(error) });
-  }
+  await enqueueStudioJob(req, res, {
+    action: "revise",
+    rewrite: {
+      action: "revise",
+      filename: req.body?.filename,
+      subject: req.body?.subject,
+      style: req.body?.style,
+      change,
+    },
+  });
 });
 
-async function rewritePromptFromRequest(req, { systemPrompt, instruction, temperature }) {
-  const original = await originalPromptForRevise(
-    req.body?.filename,
-    req.body?.subject,
-    req.body?.style,
-  );
-  const output = await falText(
-    [
-      "Original subject:",
-      original.subject || "(none)",
-      "",
-      "Original style:",
-      original.style || "(none)",
-      "",
-      instruction,
-    ].join("\n"),
-    systemPrompt,
-    { temperature },
-  );
-  return parseRevisedPrompt(output);
-}
-
-function promptRewriteRoute(options) {
+function promptRewriteRoute(action) {
   return async (req, res) => {
-    try {
-      const rewritten = await rewritePromptFromRequest(req, options);
-      res.json({ ...rewritten, model: FAL_DESCRIBE_MODEL });
-    } catch (error) {
-      res.status(500).json({ error: publicError(error) });
-    }
+    await enqueueStudioJob(req, res, {
+      action,
+      rewrite: {
+        action,
+        filename: req.body?.filename,
+        subject: req.body?.subject,
+        style: req.body?.style,
+      },
+    });
   };
 }
 
-app.post(
-  "/api/shuffle",
-  promptRewriteRoute({
-    systemPrompt: SHUFFLE_SYSTEM_PROMPT,
-    instruction: "Invent one interesting change.",
-    temperature: 0.85,
-  }),
-);
-
-app.post(
-  "/api/closeup",
-  promptRewriteRoute({
-    systemPrompt: CLOSEUP_SYSTEM_PROMPT,
-    instruction: "Rewrite as a close-up shot of this scene.",
-    temperature: 0.5,
-  }),
-);
-
-app.post(
-  "/api/twin",
-  promptRewriteRoute({
-    systemPrompt: TWIN_SYSTEM_PROMPT,
-    instruction: "Rewrite with different words. Keep the same scene.",
-    temperature: 0.7,
-  }),
-);
+app.post("/api/shuffle", promptRewriteRoute("shuffle"));
+app.post("/api/closeup", promptRewriteRoute("closeup"));
+app.post("/api/twin", promptRewriteRoute("twin"));
 
 app.post("/api/generate", async (req, res) => {
-  const subject = String(req.body?.subject ?? "").trim();
-  const style = String(req.body?.style ?? "").trim();
-  const mode = String(req.body?.mode ?? "");
-  const initPath = mode === "enlarge" ? resolveExistingFile(req.body?.image) : null;
-  const prompt = expandRandomTokens(
-    combinePrompt(subject, style) ||
-      String(req.body?.prompt ?? "").trim() ||
-      (initPath ? ENLARGE_PROMPT : ""),
-  );
-  const aspect = String(req.body?.aspect ?? "1:1");
-  const ratio = findRatio(aspect);
-  if (!prompt) {
-    res.status(400).json({ error: "Add a subject or style first." });
-    return;
-  }
-  if (mode === "enlarge" && !initPath) {
-    res.status(400).json({ error: "Enlarge needs a source image." });
-    return;
-  }
-  if (!initPath && !ratio) {
-    res.status(400).json({ error: "Unknown aspect ratio." });
-    return;
-  }
-  if (busy) {
-    res.status(409).json({ error: "A generation is already running." });
-    return;
-  }
-
-  const steps = Number(req.body?.steps ?? 4);
-  if (steps !== 2 && steps !== 4) {
-    res.status(400).json({ error: "Steps must be 2 or 4." });
-    return;
-  }
-  const sampler = findSampler(req.body?.sampler) ?? findSampler(DEFAULT_SAMPLER);
-  const strength = initPath
-    ? Math.min(1, Math.max(0.05, Number(req.body?.strength ?? ENLARGE_STRENGTH) || ENLARGE_STRENGTH))
-    : null;
-
-  let width;
-  let height;
-  if (initPath) {
-    const original = await imageSize(initPath);
-    const sized = sizeForShortSide(original.width, original.height, ENLARGE_SHORT_SIDE);
-    width = sized.width;
-    height = sized.height;
-  } else {
-    ({ width, height } = sizeForRatio(ratio));
-  }
-  const seed = Math.floor(Math.random() * 2 ** 31);
-  const filename = `${timestamp()}-${aspect.replace(":", "x")}-${seed}.png`;
-  const outputPath = path.join(GENERATED_DIR, filename);
-  const previewName = `${seed}.png`;
-  const previewPath = path.join(PREVIEW_DIR, previewName);
-  const promptPath = path.join(PREVIEW_DIR, `${seed}.txt`);
-  const initResizedPath = initPath ? path.join(PREVIEW_DIR, `${seed}-init.png`) : "";
-
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-  res.flushHeaders?.();
-  const abort = new AbortController();
-  res.on("close", () => {
-    if (!res.writableEnded) abort.abort();
+  const rewriteAction = String(req.body?.rewrite?.action ?? req.body?.rewriteAction ?? "").trim();
+  await enqueueStudioJob(req, res, {
+    action: rewriteAction || String(req.body?.mode ?? "generate"),
+    rewrite: rewriteAction
+      ? {
+          action: rewriteAction,
+          filename: req.body?.rewrite?.filename ?? req.body?.filename,
+          subject: req.body?.subject,
+          style: req.body?.style,
+          change: req.body?.rewrite?.change ?? req.body?.change,
+        }
+      : null,
   });
-  const send = (event) => {
-    if (res.writableEnded) return;
-    res.write(`data: ${JSON.stringify(event)}\n\n`);
-  };
-
-  busy = true;
-  try {
-    await ensureDirs();
-    if (!(await refreshKleinAvailability())) {
-      throw new Error(`${MODEL} is not downloaded.`);
-    }
-    send({ type: "start", previewUrl: `/preview/${previewName}` });
-    send({ type: "status", message: initPath ? "Enlarging with Draw Things" : "Generating with Draw Things" });
-    await releaseMlxForGenerate();
-    setKleinState({ loaded: true, action: "load", percent: 4, message: "Draw Things" });
-    await fs.writeFile(promptPath, prompt);
-    if (initPath) {
-      await lanczosResize(initPath, initResizedPath, width, height);
-      await fs.copyFile(initResizedPath, previewPath);
-      send({ type: "preview", url: `/preview/${previewName}?t=${Date.now()}` });
-      send({ type: "progress", step: 0, total: steps });
-    }
-    await generateWithLivePreview({
-      args: [
-        "generate",
-        "--model",
-        MODEL,
-        "--prompt-file",
-        promptPath,
-        "--width",
-        String(width),
-        "--height",
-        String(height),
-        "--steps",
-        String(steps),
-        "--seed",
-        String(seed),
-        ...(initPath ? ["--image", initResizedPath, "--strength", String(strength)] : []),
-        "--config-json",
-        JSON.stringify({ sampler: sampler.id }),
-      ],
-      outputPath,
-      previewPath,
-      onPreview: () => {
-        send({ type: "preview", url: `/preview/${previewName}?t=${Date.now()}` });
-      },
-      onProgress: ({ step, total }) => {
-        const percent = Math.max(4, Math.round((step / total) * 100));
-        setKleinState({ loaded: true, action: "load", percent, message: "Draw Things" });
-        send({ type: "progress", step, total });
-        send({
-          type: "model",
-          model: "klein",
-          action: "load",
-          percent,
-          message: "Draw Things",
-          kleinLoaded: true,
-        });
-      },
-      signal: abort.signal,
-    });
-
-    if (abort.signal.aborted) throw cancelledError();
-
-    const entry = {
-      filename,
-      subject,
-      style,
-      seed,
-      steps,
-      sampler: sampler.id,
-      aspect,
-      createdAt: new Date().toISOString(),
-      width,
-      height,
-      scale: initPath ? 2 : 1,
-      strength: strength ?? null,
-      model: MODEL,
-      source: initPath
-        ? path.basename(initPath)
-        : req.body?.source
-          ? path.basename(String(req.body.source))
-          : null,
-    };
-    const manifest = await readManifest();
-    manifest.push(entry);
-    await writeManifest(manifest);
-    setKleinState({ loaded: true, action: "idle", percent: 100, message: "Draw Things" });
-    console.log(`[klein generate] wrote ${filename} ${width}x${height}`);
-    send({
-      type: "done",
-      image: { ...entry, url: `/generated/${encodeURIComponent(filename)}` },
-    });
-    res.end();
-  } catch (error) {
-    await fs.unlink(outputPath).catch(() => {});
-    if (!res.writableEnded) {
-      send({
-        type: "error",
-        error: error?.cancelled || abort.signal.aborted ? "Generation cancelled." : publicError(error),
-      });
-      res.end();
-    }
-  } finally {
-    busy = false;
-    await fs.unlink(promptPath).catch(() => {});
-    await fs.unlink(previewPath).catch(() => {});
-    if (initResizedPath) await fs.unlink(initResizedPath).catch(() => {});
-    await refreshKleinAvailability();
-  }
 });
 
 function broadcastLibrary() {
@@ -1802,12 +1947,14 @@ await canvasBuild.watch();
 const server = app.listen(PORT, () => {
   console.log(`Klein local studio: http://127.0.0.1:${PORT}`);
   console.log(`Draw Things generate: ${MODEL}`);
+  console.log(`Local text actions: ${TEXT_MODEL_ID}`);
   console.log(`fal describe: ${FAL_DESCRIBE_MODEL}`);
   console.log(`Watching ${GENERATED_DIR}`);
   refreshKleinAvailability().catch(() => {});
 });
 
 function shutdown() {
+  textLlm.unload().catch(() => {});
   worker.stop();
   canvasBuild.dispose();
   server.close();

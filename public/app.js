@@ -52,13 +52,17 @@ function serializePrompt(el) {
 }
 
 function appendPromptLine(parent, line) {
-  const parts = String(line).split(new RegExp(TOKEN_BRACE_RE.source, "gi"));
-  for (const part of parts) {
-    if (!part) continue;
-    const token = tokenIdFromLexeme(part);
-    if (token) parent.append(createPromptChip(token));
-    else parent.append(document.createTextNode(part));
+  const text = String(line);
+  const re = new RegExp(TOKEN_BRACE_RE.source, "gi");
+  let last = 0;
+  let match;
+  while ((match = re.exec(text))) {
+    if (match.index > last) parent.append(document.createTextNode(text.slice(last, match.index)));
+    const token = tokenIdFromLexeme(match[0]);
+    parent.append(token ? createPromptChip(token) : document.createTextNode(match[0]));
+    last = match.index + match[0].length;
   }
+  if (last < text.length) parent.append(document.createTextNode(text.slice(last)));
 }
 
 function placeCaretInText(node, offset) {
@@ -239,7 +243,6 @@ function descriptionOf(image) {
 const subjectBox = document.querySelector("#describe-subject");
 const styleBox = document.querySelector("#describe-style");
 const describeBoxes = { subject: subjectBox, style: styleBox };
-const dragLiftLayer = document.querySelector("#drag-lift-layer");
 const samplerBtn = document.querySelector("#sampler-btn");
 const samplerLabel = document.querySelector("#sampler-label");
 const samplerMenuEl = document.querySelector("#sampler-menu");
@@ -690,7 +693,7 @@ function enqueuePreparedJob(job) {
   job.queued = true;
   queueTotal += 1;
   generateQueue.push(job);
-  pumpGenerateQueue();
+  startQueuedJobs();
 }
 
 function abortGeneratingSlot(job, message) {
@@ -705,35 +708,21 @@ function abortGeneratingSlot(job, message) {
   statusEl.textContent = "";
 }
 
-async function rewriteCanvasPrompt(image, nodeId, { path, pending, fail }) {
+async function rewriteCanvasPrompt(image, nodeId, { action, pending }) {
   const { job, known } = reviseJobFor(image, nodeId);
   if (!known?.filename && !known?.url) return;
+  job.subject = known.subject ?? "";
+  job.style = known.style ?? "";
+  job.rewrite = {
+    action,
+    filename: known.filename,
+    subject: job.subject,
+    style: job.style,
+  };
   showError("");
   statusEl.textContent = pending;
-  const abort = trackJob(job);
   showGeneratingSlot(job);
-  try {
-    const response = await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        filename: known.filename,
-        subject: known.subject ?? "",
-        style: known.style ?? "",
-      }),
-      signal: abort.signal,
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.error || fail);
-    if (job.cancelled) return;
-    job.subject = String(payload.subject ?? "").trim();
-    job.style = String(payload.style ?? "").trim();
-    if (!combinePrompt(job.subject, job.style)) throw new Error("The revised prompt was empty.");
-    enqueuePreparedJob(job);
-  } catch (error) {
-    if (error?.name === "AbortError" || job.cancelled) return;
-    abortGeneratingSlot(job, error.message);
-  }
+  enqueuePreparedJob(job);
 }
 
 async function submitPromptEdit(event) {
@@ -748,34 +737,20 @@ async function submitPromptEdit(event) {
   if (!image?.filename && !image?.url) return;
   const known = images.find((item) => item.filename === image.filename) ?? image;
   const { job } = reviseJobFor(known, target.nodeId);
+  job.subject = known.subject ?? "";
+  job.style = known.style ?? "";
+  job.rewrite = {
+    action: "revise",
+    filename: known.filename,
+    subject: job.subject,
+    style: job.style,
+    change,
+  };
   closePromptEdit();
   showError("");
   statusEl.textContent = "Revising prompt…";
-  const abort = trackJob(job);
   showGeneratingSlot(job);
-  try {
-    const response = await fetch("/api/revise", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        filename: known.filename,
-        subject: known.subject ?? "",
-        style: known.style ?? "",
-        change,
-      }),
-      signal: abort.signal,
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.error || "Could not revise prompt.");
-    if (job.cancelled) return;
-    job.subject = String(payload.subject ?? "").trim();
-    job.style = String(payload.style ?? "").trim();
-    if (!combinePrompt(job.subject, job.style)) throw new Error("The revised prompt was empty.");
-    enqueuePreparedJob(job);
-  } catch (error) {
-    if (error?.name === "AbortError" || job.cancelled) return;
-    abortGeneratingSlot(job, error.message);
-  }
+  enqueuePreparedJob(job);
 }
 
 function sizeForShortSide(width, height, shortSide = ENLARGE_SHORT_SIDE) {
@@ -903,22 +878,19 @@ function openImageMenu(detail) {
         else if (action.id === "enlarge") enlargeCanvasImage(image, detail.nodeId);
         else if (action.id === "closeup") {
           await rewriteCanvasPrompt(image, detail.nodeId, {
-            path: "/api/closeup",
+            action: "closeup",
             pending: "Framing a close up…",
-            fail: "Could not write a close-up prompt.",
           });
         } else if (action.id === "prompt") openPromptEdit(detail);
         else if (action.id === "twin") {
           await rewriteCanvasPrompt(image, detail.nodeId, {
-            path: "/api/twin",
+            action: "twin",
             pending: "Writing a twin prompt…",
-            fail: "Could not write a twin prompt.",
           });
         } else if (action.id === "shuffle") {
           await rewriteCanvasPrompt(image, detail.nodeId, {
-            path: "/api/shuffle",
+            action: "shuffle",
             pending: "Shuffling prompt…",
-            fail: "Could not shuffle prompt.",
           });
         }
         else if (action.id === "grid") {
@@ -1304,112 +1276,6 @@ function mealUrlsFrom(detail) {
   return detail?.url ? [detail.url] : [];
 }
 
-const DRAG_LIFT_OUT_MS = 280;
-let dragLiftGen = 0;
-let dragLiftHideTimer = 0;
-
-function hideDragLiftLayer() {
-  clearTimeout(dragLiftHideTimer);
-  dragLiftHideTimer = 0;
-  delete dragLiftLayer.dataset.easingIn;
-  dragLiftLayer.hidden = true;
-  dragLiftLayer.replaceChildren();
-}
-
-function notifyDragLiftSettled() {
-  window.dispatchEvent(new CustomEvent("klein:drag-lift-settled"));
-}
-
-function settleDragLift(immediate = false) {
-  const wraps = [...dragLiftLayer.querySelectorAll(".drag-lift")];
-  const gen = dragLiftGen;
-  let finished = false;
-  const finish = () => {
-    if (finished || gen !== dragLiftGen) return;
-    finished = true;
-    dragLiftGen += 1;
-    hideDragLiftLayer();
-    notifyDragLiftSettled();
-  };
-  if (immediate || reduceDescribeMotion() || !wraps.length || dragLiftLayer.hidden) {
-    finish();
-    return;
-  }
-  const onEnd = (event) => {
-    if (event.propertyName && event.propertyName !== "transform") return;
-    finish();
-  };
-  for (const wrap of wraps) {
-    wrap.classList.remove("is-lifted");
-    wrap.classList.add("is-settling");
-    wrap.addEventListener("transitionend", onEnd, { once: true });
-  }
-  clearTimeout(dragLiftHideTimer);
-  dragLiftHideTimer = window.setTimeout(finish, DRAG_LIFT_OUT_MS);
-}
-
-function setDragLift(detail) {
-  if (!detail?.on) {
-    settleDragLift(Boolean(detail?.immediate));
-    return;
-  }
-  const items = Array.isArray(detail.items) && detail.items.length
-    ? detail.items
-    : detail.url
-      ? [detail]
-      : [];
-  if (!items.length) {
-    settleDragLift(true);
-    return;
-  }
-  const resuming =
-    !dragLiftLayer.hidden &&
-    Boolean(dragLiftLayer.querySelector(".drag-lift")) &&
-    !dragLiftLayer.querySelector(".drag-lift.is-settling");
-  if (!resuming) {
-    dragLiftGen += 1;
-    clearTimeout(dragLiftHideTimer);
-    dragLiftHideTimer = 0;
-    dragLiftLayer.dataset.easingIn = "1";
-  }
-  dragLiftLayer.hidden = false;
-  const existing = [...dragLiftLayer.querySelectorAll(".drag-lift")];
-  while (existing.length > items.length) existing.pop().remove();
-  const easingIn = dragLiftLayer.dataset.easingIn === "1";
-  items.forEach((item, index) => {
-    let wrap = existing[index];
-    if (!wrap) {
-      wrap = document.createElement("div");
-      wrap.className = "drag-lift";
-      const img = document.createElement("img");
-      img.className = "drag-lift-img";
-      img.alt = "";
-      wrap.append(img);
-      dragLiftLayer.append(wrap);
-    }
-    const img = wrap.querySelector("img");
-    if (item.url && img.getAttribute("src") !== item.url) img.src = item.url;
-    wrap.classList.toggle("is-group", detail.mode === "group");
-    wrap.classList.remove("is-settling");
-    if (resuming && !easingIn) wrap.classList.add("is-lifted");
-    wrap.style.left = `${Math.round(item.x || 0)}px`;
-    wrap.style.top = `${Math.round(item.y || 0)}px`;
-    wrap.style.width = `${Math.round(item.width || 0)}px`;
-    wrap.style.height = `${Math.round(item.height || 0)}px`;
-  });
-  if (resuming) return;
-  const gen = dragLiftGen;
-  window.requestAnimationFrame(() => {
-    window.requestAnimationFrame(() => {
-      if (gen !== dragLiftGen) return;
-      delete dragLiftLayer.dataset.easingIn;
-      for (const wrap of dragLiftLayer.querySelectorAll(".drag-lift")) {
-        wrap.classList.add("is-lifted");
-      }
-    });
-  });
-}
-
 function prepareEat(box, { width, height, force = false } = {}) {
   if (!box) return;
   const part = partOfBox(box);
@@ -1775,12 +1641,20 @@ async function runGenerateJob(job) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        id: job.id,
         subject: job.subject,
         style: job.style,
         steps: job.steps,
         sampler: job.sampler,
         aspect: job.aspect,
         source: job.source,
+        ...(job.rewrite
+          ? {
+              rewrite: job.rewrite,
+              filename: job.rewrite.filename,
+              change: job.rewrite.change,
+            }
+          : {}),
         ...(job.mode === "enlarge"
           ? {
               mode: "enlarge",
@@ -1795,7 +1669,9 @@ async function runGenerateJob(job) {
     if (response.status === 409) {
       await new Promise((resolve) => setTimeout(resolve, 400));
       if (job.cancelled) return "cancelled";
+      job.started = false;
       generateQueue.unshift(job);
+      startQueuedJobs();
       return false;
     }
     if (!response.ok) {
@@ -1864,21 +1740,53 @@ async function runGenerateJob(job) {
   }
 }
 
-async function pumpGenerateQueue() {
-  if (queueRunning) return;
+let inflightJobs = 0;
+let queueFailed = 0;
+
+function finishQueueIfIdle() {
+  if (inflightJobs > 0) return;
+  const leftover = generateQueue.filter((job) => !job.cancelled);
+  if (leftover.some((job) => !job.started)) {
+    startQueuedJobs();
+    return;
+  }
+  if (leftover.length) return;
+  generateQueue = [];
+  queueRunning = false;
+  const failed = queueFailed;
+  const generatedCount = Math.max(0, queueTotal - failed);
+  statusEl.textContent =
+    failed && generatedCount
+      ? `Generated ${generatedCount}, ${failed} failed.`
+      : failed
+        ? `${failed} thumbnail${failed === 1 ? "" : "s"} failed.`
+        : `Generated ${generatedCount} thumbnail${generatedCount === 1 ? "" : "s"}.`;
+  kleinLog("app", "generate-end", { generated: generatedCount, failed });
+  queueDone = 0;
+  queueTotal = 0;
+  queueFailed = 0;
+  window.dispatchEvent(new CustomEvent("klein:generate-end"));
+  setBusy(false, statusEl.textContent);
+}
+
+function startQueuedJobs() {
+  const pending = generateQueue.filter((job) => !job.started && !job.cancelled);
+  if (!pending.length) {
+    finishQueueIfIdle();
+    return;
+  }
   queueRunning = true;
   setBusy(true, statusEl.textContent || "Generating…");
-  let failed = 0;
-  try {
-    while (generateQueue.length) {
-      const job = generateQueue.shift();
-      if (job.cancelled) continue;
-      try {
-        const result = await runGenerateJob(job);
-        if (result === "cancelled") continue;
-        if (result) queueDone += 1;
-      } catch (error) {
-        failed += 1;
+  for (const job of pending) {
+    job.started = true;
+    inflightJobs += 1;
+    setBusy(true, queueStatus(job.aspect, "", job.mode === "enlarge" ? "Enlarging" : "Generating"));
+    runGenerateJob(job)
+      .then((result) => {
+        if (result === true) queueDone += 1;
+      })
+      .catch((error) => {
+        queueFailed += 1;
         queueDone += 1;
         window.dispatchEvent(
           new CustomEvent("klein:generate-error", {
@@ -1888,27 +1796,17 @@ async function pumpGenerateQueue() {
         kleinLog("app", "generate-error", { id: job.id, error: error.message });
         console.warn("Klein generate failed:", error.message);
         showError(error.message);
-      }
-    }
-  } finally {
-    queueRunning = false;
-    if (generateQueue.length) {
-      pumpGenerateQueue();
-      return;
-    }
-    const generatedCount = queueTotal - failed;
-    statusEl.textContent =
-      failed && generatedCount
-        ? `Generated ${generatedCount}, ${failed} failed.`
-        : failed
-          ? `${failed} thumbnail${failed === 1 ? "" : "s"} failed.`
-          : `Generated ${generatedCount} thumbnail${generatedCount === 1 ? "" : "s"}.`;
-    queueDone = 0;
-    queueTotal = 0;
-    kleinLog("app", "generate-end", { generated: generatedCount, failed });
-    window.dispatchEvent(new CustomEvent("klein:generate-end"));
-    setBusy(false, statusEl.textContent);
+      })
+      .finally(() => {
+        inflightJobs = Math.max(0, inflightJobs - 1);
+        generateQueue = generateQueue.filter((item) => item.id !== job.id);
+        finishQueueIfIdle();
+      });
   }
+}
+
+function pumpGenerateQueue() {
+  startQueuedJobs();
 }
 
 function generateBoard() {
@@ -2031,9 +1929,6 @@ for (const el of promptEls) {
 window.addEventListener("klein:cancel-generate", (event) => {
   cancelGenerateJob(event.detail?.id);
 });
-window.addEventListener("klein:drag-lift", (event) => {
-  setDragLift(event.detail);
-});
 window.addEventListener("klein:describe", async (event) => {
   const list = (
     Array.isArray(event.detail?.images) && event.detail.images.length
@@ -2048,7 +1943,6 @@ window.addEventListener("klein:describe", async (event) => {
   const items = Array.isArray(event.detail?.items) ? event.detail.items : [];
   const box = describeBoxes[part];
   const firstSize = items[0] || event.detail || known[0];
-  setDragLift({ on: false, immediate: true });
   beginEat(box, {
     urls: known.map((image, index) => image.url || items[index]?.url).filter(Boolean),
     width: firstSize.width,

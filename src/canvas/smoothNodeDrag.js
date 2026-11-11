@@ -1,8 +1,9 @@
 const DRAG_LERP_FOLLOW = 0.38;
 const DRAG_LERP_SETTLE = 0.22;
 const DRAG_LERP_EPSILON = 0.45;
+export const DRAG_LIFT_PX = 10;
 
-export function createSmoothDragController({ setNodes, snapToGrid }) {
+export function createSmoothDragController({ setNodes, snapToGrid, getDropOffset }) {
   const stateRef = { current: null };
 
   const tick = () => {
@@ -73,12 +74,16 @@ export function createSmoothDragController({ setNodes, snapToGrid }) {
     onDragStop(_event, node) {
       const state = stateRef.current;
       if (!state || state.id !== node.id) return;
-      state.dragging = false;
-      state.target = {
-        x: snapToGrid(state.target.x),
-        y: snapToGrid(state.target.y),
+      const extra = getDropOffset?.() ?? { x: 0, y: 0 };
+      const next = {
+        x: snapToGrid(state.target.x + extra.x),
+        y: snapToGrid(state.target.y + extra.y),
       };
-      schedule();
+      if (state.rafId) cancelAnimationFrame(state.rafId);
+      stateRef.current = null;
+      setNodes((nodes) =>
+        nodes.map((item) => (item.id === node.id ? { ...item, position: next } : item)),
+      );
     },
 
     onNodesChange(changes, applyChanges) {

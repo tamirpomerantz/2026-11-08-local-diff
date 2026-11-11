@@ -30,6 +30,8 @@
   --strip-width: 168px;
   --board-gutter: 24px;
   --board-width: 372px;
+  --canvas-drag-lift: 10px;
+  --canvas-select-ring: 6px;
   font-family: Outfit, ui-sans-serif, system-ui, sans-serif;
   font-feature-settings: "ss01", "ss02";
 }
@@ -253,69 +255,62 @@ select {
 
 .react-flow__node.draggable > * {
   transform-origin: center center;
-  transition:
-    transform 0.32s cubic-bezier(0.22, 1, 0.36, 1),
-    box-shadow 0.32s cubic-bezier(0.22, 1, 0.36, 1);
-  box-shadow: none;
-}
-
-.react-flow__node.dragging,
-.react-flow__node.lifting {
-  z-index: 1000 !important;
-  opacity: 0;
-}
-
-.drag-lift-layer {
-  position: fixed;
-  inset: 0;
-  z-index: 50;
-  pointer-events: none;
-  perspective: 1100px;
-}
-
-.drag-lift-layer[hidden] {
-  display: none;
-}
-
-.drag-lift {
-  position: absolute;
-  margin: 0;
-  padding: 0;
-  background: transparent;
-  transform-origin: center center;
-  transform-style: preserve-3d;
-  transform: rotateX(0deg) rotateY(0deg) translateZ(0);
-  filter: none;
-  transition:
-    transform 0.28s cubic-bezier(0.4, 0, 0.6, 1),
-    filter 0.28s cubic-bezier(0.4, 0, 0.6, 1);
-}
-
-.drag-lift.is-lifted {
-  transform: rotateX(10deg) rotateY(-8deg) translateZ(24px);
-  filter: drop-shadow(0 4px 6px rgba(20, 20, 19, 0.06))
-    drop-shadow(0 14px 32px rgba(20, 20, 19, 0.14))
-    drop-shadow(0 28px 56px rgba(20, 20, 19, 0.1));
-}
-
-.drag-lift.is-settling {
-  transform: rotateX(0deg) rotateY(0deg) translateZ(0);
+  transform: translate3d(0, 0, 0);
   filter: none;
   transition:
     transform 0.24s cubic-bezier(0.22, 1, 0.36, 1),
-    filter 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+    box-shadow 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+  box-shadow: none;
 }
 
-.drag-lift-img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  margin: 0;
-  padding: 0;
-  border: 1px solid var(--border);
-  border-radius: 20px;
-  object-fit: cover;
-  background: var(--card);
+.react-flow__node.selected:not(.exiting):not(.lifting) > .canvas-image {
+  box-shadow: 0 0 0 var(--canvas-select-ring) var(--primary);
+}
+
+.react-flow__node.dragging:not(.exiting):not(.lifting) {
+  z-index: 1000 !important;
+}
+
+.react-flow__node.dragging:not(.exiting):not(.lifting) > * {
+  transform: translate3d(0, calc(-1 * var(--canvas-drag-lift)), 0);
+  filter: none;
+  box-shadow:
+    0 4px 6px rgba(20, 20, 19, 0.06),
+    0 14px 32px rgba(20, 20, 19, 0.14),
+    0 28px 56px rgba(20, 20, 19, 0.1);
+  transition:
+    transform 0.28s cubic-bezier(0.4, 0, 0.6, 1),
+    box-shadow 0.28s cubic-bezier(0.4, 0, 0.6, 1);
+  will-change: transform, box-shadow;
+}
+
+.react-flow__node.selected.dragging:not(.exiting):not(.lifting) > .canvas-image {
+  box-shadow:
+    0 0 0 var(--canvas-select-ring) var(--primary),
+    0 4px 6px rgba(20, 20, 19, 0.06),
+    0 14px 32px rgba(20, 20, 19, 0.14),
+    0 28px 56px rgba(20, 20, 19, 0.1);
+}
+
+.react-flow__node.dropping > *,
+.react-flow__node.dropping.draggable > *,
+.react-flow__node.selected.dropping > .canvas-image {
+  transition: none !important;
+  transform: none !important;
+}
+
+.react-flow__node.selected.dropping:not(.exiting) > .canvas-image {
+  box-shadow: 0 0 0 var(--canvas-select-ring) var(--primary);
+}
+
+.react-flow__node.dragging .canvas-image-delete {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.react-flow__node.lifting {
+  z-index: 1000 !important;
+  opacity: 0;
 }
 
 .react-flow__node.exiting {
@@ -341,20 +336,20 @@ select {
     transition: none;
   }
 
-  .react-flow__node.draggable.dragging > * {
+  .react-flow__node.dragging:not(.exiting):not(.lifting) > * {
     transform: none;
-    box-shadow: none;
+    filter: none;
+    box-shadow:
+      0 14px 32px rgba(20, 20, 19, 0.14),
+      0 28px 56px rgba(20, 20, 19, 0.1);
     will-change: auto;
-    transform-style: flat;
   }
 
-  .drag-lift,
-  .drag-lift.is-lifted,
-  .drag-lift.is-settling {
-    transition: none;
-    transform: none;
-    filter: drop-shadow(0 14px 32px rgba(20, 20, 19, 0.14))
-      drop-shadow(0 28px 56px rgba(20, 20, 19, 0.1));
+  .react-flow__node.selected.dragging:not(.exiting):not(.lifting) > .canvas-image {
+    box-shadow:
+      0 0 0 var(--canvas-select-ring) var(--primary),
+      0 14px 32px rgba(20, 20, 19, 0.14),
+      0 28px 56px rgba(20, 20, 19, 0.1);
   }
 
   .react-flow__node.exiting > *,
@@ -368,6 +363,7 @@ select {
 
 .canvas-image {
   position: relative;
+  border-radius: 20px;
 }
 
 .canvas-image-card {
@@ -376,12 +372,12 @@ select {
   border-radius: 20px;
   background: var(--card);
   border: 1px solid var(--border);
+  outline: none;
   transition: border-radius 0.18s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .canvas-image-card.is-selected {
-  outline: 6px solid var(--primary);
-  outline-offset: 0;
+  outline: none;
 }
 
 .canvas-image-card.is-exiting,

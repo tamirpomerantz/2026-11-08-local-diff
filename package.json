@@ -4,13 +4,15 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "pull-text-model": "node src/localLlm.js"
   },
   "dependencies": {
     "@xyflow/react": "^12.10.1",
     "esbuild": "^0.28.2",
     "express": "^4.21.2",
     "lucide": "^1.70.0",
+    "node-llama-cpp": "^3.22.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   }

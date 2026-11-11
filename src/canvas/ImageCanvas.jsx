@@ -8,6 +8,7 @@ import {
 import { ImageNode } from "./ImageNode.jsx";
 import { RowBackground } from "./RowBackground.jsx";
 import { snapToGrid } from "./gridSnap.js";
+import { createSmoothDragController, DRAG_LIFT_PX } from "./smoothNodeDrag.js";
 import {
   NODE_GAP,
   NODE_WIDTH,
@@ -18,7 +19,6 @@ import {
   nodeWidth,
   occupiedBoxes,
 } from "./placement.js";
-import { createSmoothDragController } from "./smoothNodeDrag.js";
 import { kleinLog, nodeIds } from "../debugLog.js";
 
 const DEFAULT_VIEWPORT = { x: 0, y: 0, zoom: 1 };
@@ -36,6 +36,12 @@ function easeOutQuart(t) {
 
 function prefersReducedMotion() {
   return Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+}
+
+function dropPlaceOffset(zoom) {
+  if (prefersReducedMotion()) return { x: 0, y: 0 };
+  const z = Number(zoom) > 0 ? Number(zoom) : 1;
+  return { x: 0, y: -DRAG_LIFT_PX / z };
 }
 
 function wait(ms) {
@@ -71,7 +77,8 @@ function describePartFromPoint(event) {
 
 function nodeScreenRect(node) {
   const el = document.querySelector(`.react-flow__node[data-id="${CSS.escape(String(node.id))}"]`);
-  return el?.getBoundingClientRect() ?? null;
+  const card = el?.querySelector(".canvas-image-card");
+  return card?.getBoundingClientRect() ?? el?.getBoundingClientRect() ?? null;
 }
 
 function liftItem(node) {
@@ -89,19 +96,6 @@ function liftItem(node) {
 function nodesForDrag(node, nodes, fallback) {
   if (Array.isArray(nodes) && nodes.length) return nodes;
   return fallback.filter((item) => item.selected || item.id === node.id);
-}
-
-function liftSingleDetail(node) {
-  if (!node?.data?.image?.url) return { on: false };
-  return { on: true, mode: "single", items: [liftItem(node)] };
-}
-
-function liftGroupDetail(nodes) {
-  const items = nodes
-    .filter((item) => item.data?.image?.url && !item.data?.exiting)
-    .map(liftItem);
-  if (!items.length) return { on: false };
-  return { on: true, mode: "group", items };
 }
 
 function nodeClassList(node) {
@@ -273,8 +267,6 @@ export function ImageCanvas() {
   const hydratedRef = useRef(false);
   const describeDropOriginRef = useRef(null);
   const dragSessionRef = useRef({ mode: null, ids: [] });
-  const liftEpochRef = useRef(0);
-  const pendingLiftClearRef = useRef(null);
   const reflowRef = useRef({ gen: 0, raf: 0 });
   nodesRef.current = nodes;
 
@@ -286,7 +278,11 @@ export function ImageCanvas() {
 
   const smoothDragRef = useRef(null);
   if (!smoothDragRef.current) {
-    smoothDragRef.current = createSmoothDragController({ setNodes, snapToGrid });
+    smoothDragRef.current = createSmoothDragController({
+      setNodes,
+      snapToGrid,
+      getDropOffset: () => dropPlaceOffset(viewportRef.current.zoom),
+    });
   }
 
   const persistLayout = useCallback((immediate = false) => {
@@ -393,7 +389,6 @@ export function ImageCanvas() {
       setNodes((current) => {
         const next = [];
         const seen = new Set();
-        const keptMissing = [];
         for (const node of current) {
           if (node.data?.generating || String(node.id).startsWith("gen:")) {
             next.push(node);
@@ -401,7 +396,6 @@ export function ImageCanvas() {
           }
           const image = incoming.get(node.id);
           if (!image) {
-            keptMissing.push(node.id);
             next.push(node);
             seen.add(node.id);
             continue;
@@ -413,7 +407,6 @@ export function ImageCanvas() {
           });
         }
         const saved = layoutRef.current.positions || {};
-        const added = [];
         for (const image of images) {
           if (seen.has(image.filename)) continue;
           const stored = saved[image.filename];
@@ -422,15 +415,7 @@ export function ImageCanvas() {
             : placeImage(image);
           next.push(toNode(image, position));
           seen.add(image.filename);
-          added.push(image.filename);
         }
-        kleinLog("canvas", "sync", {
-          incoming: images.length,
-          before: nodeIds(current),
-          after: nodeIds(next),
-          added,
-          keptMissing,
-        });
         return next;
       });
     },
@@ -644,45 +629,45 @@ export function ImageCanvas() {
     [onNodesChange, persistLayout],
   );
 
-  const markLifting = (ids, { zIndex } = {}) => {
+  const freezeDropTransform = (ids) => {
     setNodes((current) =>
-      current.map((item) => {
-        if (!ids.has(item.id)) return item;
-        const next = withNodeClass(item, "lifting");
-        return zIndex == null ? next : { ...next, zIndex };
-      }),
+      current.map((item) => (ids.has(item.id) ? withNodeClass(item, "dropping") : item)),
     );
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        setNodes((current) =>
+          current.map((item) => (ids.has(item.id) ? withoutNodeClass(item, "dropping") : item)),
+        );
+      });
+    });
   };
 
-  useEffect(() => {
-    const onLiftSettled = () => {
-      const pending = pendingLiftClearRef.current;
-      pendingLiftClearRef.current = null;
-      if (!pending || pending.epoch !== liftEpochRef.current) return;
-      const ids = pending.ids;
+  const hideThenRestore = (ids, originById) => {
+    setNodes((current) =>
+      current.map((item) => {
+        if (!ids.has(item.id)) return withoutNodeClass(item, "lifting");
+        const origin = originById.get(item.id);
+        return {
+          ...withNodeClass(item, "lifting"),
+          position: origin || item.position,
+          zIndex: undefined,
+        };
+      }),
+    );
+    requestAnimationFrame(() => {
       setNodes((current) =>
-        current.map((item) => {
-          const next = withoutNodeClass(item, "lifting");
-          return ids.has(item.id) ? { ...next, zIndex: undefined } : next;
-        }),
+        current.map((item) => (ids.has(item.id) ? withoutNodeClass(item, "lifting") : item)),
       );
-    };
-    window.addEventListener("klein:drag-lift-settled", onLiftSettled);
-    return () => window.removeEventListener("klein:drag-lift-settled", onLiftSettled);
-  }, [setNodes]);
+    });
+  };
 
   const startSingleDrag = (event, node) => {
     describeDropOriginRef.current = { id: node.id, position: { ...node.position } };
-    liftEpochRef.current += 1;
-    pendingLiftClearRef.current = null;
-    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: liftSingleDetail(node) }));
-    markLifting(new Set([node.id]), { zIndex: 1000 });
     smoothDragRef.current.onDragStart(event, node);
   };
 
   const moveSingleDrag = (event, node) => {
     smoothDragRef.current.onDrag(event, node);
-    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: liftSingleDetail(node) }));
     window.dispatchEvent(
       new CustomEvent("klein:describe-hover", {
         detail: describePointerDetail(node, describePartFromPoint(event)),
@@ -699,19 +684,11 @@ export function ImageCanvas() {
       node.data?.image?.url &&
       !node.data?.generating &&
       !node.data?.exiting;
+    window.dispatchEvent(new CustomEvent("klein:describe-hover", { detail: { on: false } }));
     if (dropped && origin?.id === node.id) {
-      liftEpochRef.current += 1;
-      pendingLiftClearRef.current = null;
-      window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: { on: false, immediate: true } }));
       const size = liftItem(node);
       smoothDragRef.current.cancelActive?.();
-      setNodes((current) =>
-        current.map((item) =>
-          item.id === node.id
-            ? { ...withoutNodeClass(item, "lifting"), position: origin.position, zIndex: undefined }
-            : withoutNodeClass(item, "lifting"),
-        ),
-      );
+      hideThenRestore(new Set([node.id]), new Map([[node.id, origin.position]]));
       window.dispatchEvent(
         new CustomEvent("klein:describe", {
           detail: {
@@ -725,9 +702,7 @@ export function ImageCanvas() {
       );
       return;
     }
-    pendingLiftClearRef.current = { epoch: liftEpochRef.current, ids: new Set([node.id]) };
-    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: { on: false } }));
-    window.dispatchEvent(new CustomEvent("klein:describe-hover", { detail: { on: false } }));
+    freezeDropTransform(new Set([node.id]));
     smoothDragRef.current.onDragStop(event, node);
     persistLayout();
   };
@@ -737,14 +712,9 @@ export function ImageCanvas() {
       id: item.id,
       position: { ...item.position },
     }));
-    liftEpochRef.current += 1;
-    pendingLiftClearRef.current = null;
-    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: liftGroupDetail(group) }));
-    markLifting(new Set(group.map((item) => item.id)));
   };
 
   const moveGroupDrag = (event, group) => {
-    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: liftGroupDetail(group) }));
     window.dispatchEvent(
       new CustomEvent("klein:describe-hover", {
         detail: describePointerDetail(group[0], describePartFromPoint(event)),
@@ -761,18 +731,9 @@ export function ImageCanvas() {
       (item) => item.data?.image?.url && !item.data?.generating && !item.data?.exiting,
     );
     const dropped = Boolean(part) && sources.length >= 1;
+    window.dispatchEvent(new CustomEvent("klein:describe-hover", { detail: { on: false } }));
     if (dropped) {
-      liftEpochRef.current += 1;
-      pendingLiftClearRef.current = null;
-      window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: { on: false, immediate: true } }));
-      window.dispatchEvent(new CustomEvent("klein:describe-hover", { detail: { on: false } }));
-      setNodes((current) =>
-        current.map((item) => {
-          const origin = originById.get(item.id);
-          const next = withoutNodeClass(item, "lifting");
-          return origin ? { ...next, position: origin, zIndex: undefined } : next;
-        }),
-      );
+      hideThenRestore(new Set(group.map((item) => item.id)), originById);
       const picked = sources.slice(0, 4);
       window.dispatchEvent(
         new CustomEvent("klein:describe", {
@@ -785,12 +746,24 @@ export function ImageCanvas() {
       );
       return;
     }
-    pendingLiftClearRef.current = {
-      epoch: liftEpochRef.current,
-      ids: new Set(group.map((item) => item.id)),
-    };
-    window.dispatchEvent(new CustomEvent("klein:drag-lift", { detail: { on: false } }));
-    window.dispatchEvent(new CustomEvent("klein:describe-hover", { detail: { on: false } }));
+    const ids = new Set(group.map((item) => item.id));
+    const extra = dropPlaceOffset(viewportRef.current.zoom);
+    freezeDropTransform(ids);
+    if (extra.x || extra.y) {
+      setNodes((current) =>
+        current.map((item) =>
+          ids.has(item.id)
+            ? {
+                ...item,
+                position: {
+                  x: snapToGrid(item.position.x + extra.x),
+                  y: snapToGrid(item.position.y + extra.y),
+                },
+              }
+            : item,
+        ),
+      );
+    }
     persistLayout();
   };
 
@@ -801,7 +774,7 @@ export function ImageCanvas() {
     dragSessionRef.current = { mode, ids: group.map((item) => item.id) };
     if (mode === "group") startGroupDrag(group);
     else startSingleDrag(event, node);
-  }, [setNodes, stopReflow]);
+  }, [stopReflow]);
 
   const onNodeDrag = useCallback((event, node, nodes) => {
     if (dragSessionRef.current.mode === "group") {

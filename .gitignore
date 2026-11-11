@@ -4,6 +4,7 @@ public/canvas.css
 public/canvas.js.map
 .venv
 .hf-cache
+models
 python/__pycache__
 *.pyc
 generated/*.png
