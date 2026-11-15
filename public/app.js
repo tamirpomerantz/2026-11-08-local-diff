@@ -1207,8 +1207,18 @@ function storedPartFor(source, part) {
 
 const COMBINE_MAX_IMAGES = 4;
 
+function allHaveStoredPrompts(sources) {
+  return (
+    Array.isArray(sources) &&
+    sources.length > 1 &&
+    sources.every((item) => storedPartFor(item, "subject") && storedPartFor(item, "style"))
+  );
+}
+
 async function describeWithFal(entries, part, signal) {
-  const list = (Array.isArray(entries) ? entries : [entries]).filter((item) => item?.image);
+  const list = (Array.isArray(entries) ? entries : [entries]).filter(
+    (item) => item?.image || item?.filename,
+  );
   if (!list.length) throw new Error("Drop an image onto the prompt to describe it.");
   const task = part === "style" ? "style" : "subject";
   const combine = list.length > 1;
@@ -1219,7 +1229,7 @@ async function describeWithFal(entries, part, signal) {
       combine
         ? {
             images: list.map((item) => ({
-              image: item.image,
+              ...(item.image ? { image: item.image } : {}),
               ...(item.filename ? { filename: item.filename } : {}),
             })),
             part: task,
@@ -1237,7 +1247,12 @@ async function describeWithFal(entries, part, signal) {
   const text = String(described[task] ?? "").trim();
   if (!text) throw new Error("Describe failed.");
   if (!combine && list[0].filename) rememberDescription(list[0].filename, { [task]: text });
-  return text;
+  return {
+    text,
+    local: Boolean(described.local),
+    subject: String(described.subject ?? "").trim(),
+    style: String(described.style ?? "").trim(),
+  };
 }
 
 const mealObjectUrls = { subject: [], style: [] };
@@ -1443,21 +1458,33 @@ async function describeFromSource(source, { alreadyEating = false, part = "subje
     if (describeGen[task] !== gen) return null;
     settleWaiting(box, gen);
     let text = combine ? "" : storedPartFor(sources[0], task);
+    let fused = null;
     if (!text) {
+      const localCombine = combine && allHaveStoredPrompts(sources);
       const entries = [];
-      for (const item of sources) {
-        const blob = await blobFromSource(item);
-        const small = await shrinkForDescribe(blob);
-        if (describeGen[task] !== gen) return null;
-        entries.push({ image: await blobToDataUrl(small), filename: item.filename });
+      if (localCombine) {
+        for (const item of sources) entries.push({ filename: item.filename });
+      } else {
+        for (const item of sources) {
+          const blob = await blobFromSource(item);
+          const small = await shrinkForDescribe(blob);
+          if (describeGen[task] !== gen) return null;
+          entries.push({ image: await blobToDataUrl(small), filename: item.filename });
+        }
       }
-      text = await describeWithFal(entries, task, ac.signal);
+      fused = await describeWithFal(entries, task, ac.signal);
+      text = fused.text;
     } else {
       await waitDescribe(450);
     }
     if (describeGen[task] !== gen) return null;
     describing[task] = false;
-    applyDescribedPart(task, text);
+    if (fused?.local) {
+      if (fused.subject) applyDescribedPart("subject", fused.subject);
+      if (fused.style) applyDescribedPart("style", fused.style);
+    } else {
+      applyDescribedPart(task, text);
+    }
     describeStatus(combine ? "Combination ready." : "Description ready.");
     revealed = true;
     await fadeWaiting(box, gen, task);

@@ -1,5 +1,6 @@
 export function createJobQueue({ rewriteJobs, generateJob, unloadText, onIdle, log = console.log } = {}) {
   const pending = [];
+  const textWaiters = [];
   let pumping = false;
   let phase = "idle";
   let current = null;
@@ -16,6 +17,7 @@ export function createJobQueue({ rewriteJobs, generateJob, unloadText, onIdle, l
       waiting: jobs.length,
       rewrite: jobs.filter((job) => job.stage === "rewrite").length,
       generate: jobs.filter((job) => job.stage === "generate").length,
+      text: textWaiters.length,
     };
   }
 
@@ -60,24 +62,38 @@ export function createJobQueue({ rewriteJobs, generateJob, unloadText, onIdle, l
     try {
       while (true) {
         prune();
+        const waiters = textWaiters.splice(0);
         const rewriteBatch = pending.filter((job) => job.stage === "rewrite" && !job.cancelled);
-        if (rewriteBatch.length) {
+        const hadText = waiters.length || rewriteBatch.length;
+        if (hadText) {
           phase = "rewrite";
-          current = rewriteBatch[0];
-          logState(`rewrite batch ${rewriteBatch.length}`);
-          try {
-            await rewriteJobs(rewriteBatch);
-          } catch (error) {
-            for (const job of rewriteBatch) {
-              if (job.stage === "rewrite") fail(job, error);
+          if (waiters.length) {
+            logState(`text tasks ${waiters.length}`);
+            for (const waiter of waiters) {
+              try {
+                waiter.resolve(await waiter.fn());
+              } catch (error) {
+                waiter.reject(error);
+              }
             }
           }
-          current = null;
+          if (rewriteBatch.length) {
+            current = rewriteBatch[0];
+            logState(`rewrite batch ${rewriteBatch.length}`);
+            try {
+              await rewriteJobs(rewriteBatch);
+            } catch (error) {
+              for (const job of rewriteBatch) {
+                if (job.stage === "rewrite") fail(job, error);
+              }
+            }
+            current = null;
+          }
         }
 
         const generateBatch = pending.filter((job) => job.stage === "generate" && !job.cancelled);
         if (!generateBatch.length) {
-          if (!rewriteBatch.length) break;
+          if (!hadText) break;
           continue;
         }
         phase = "generate";
@@ -108,7 +124,7 @@ export function createJobQueue({ rewriteJobs, generateJob, unloadText, onIdle, l
         // Unload is best-effort.
       }
       prune();
-      if (activeJobs().length) pump();
+      if (activeJobs().length || textWaiters.length) pump();
       else {
         logState("idle");
         try {
@@ -127,6 +143,13 @@ export function createJobQueue({ rewriteJobs, generateJob, unloadText, onIdle, l
       pump();
       return job;
     },
+    runText(fn) {
+      return new Promise((resolve, reject) => {
+        textWaiters.push({ fn, resolve, reject });
+        logState("+text");
+        pump();
+      });
+    },
     cancel(id) {
       const match = String(id ?? "");
       if (!match) return;
@@ -141,9 +164,19 @@ export function createJobQueue({ rewriteJobs, generateJob, unloadText, onIdle, l
         current.abort?.abort();
       }
     },
+    cancelAll() {
+      for (const job of pending) {
+        job.cancelled = true;
+        job.abort?.abort();
+      }
+      if (current) {
+        current.cancelled = true;
+        current.abort?.abort();
+      }
+    },
     snapshot,
     isBusy() {
-      return pumping || activeJobs().length > 0;
+      return pumping || activeJobs().length > 0 || textWaiters.length > 0;
     },
   };
 }

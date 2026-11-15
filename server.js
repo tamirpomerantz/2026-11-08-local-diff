@@ -104,6 +104,12 @@ const COMBINE_STYLE_PROMPT =
   "Do not name or describe the subject, people, objects, or poses. " +
   "Do not call it a screenshot or an image. Do not mention that there were several pictures. " +
   "Output only the style brief.";
+const COMBINE_TEXT_SYSTEM_PROMPT =
+  "You fuse several text-to-image prompts into ONE new prompt. " +
+  "Mix the subjects into a single original scene and mix the styles into one hybrid look. " +
+  "Do not list the inputs separately. Do not mention that there were several prompts. " +
+  "Subject is who or what is depicted and how they are posed. Style is medium, palette, light, and mood only. " +
+  'Reply with JSON only: {"subject":"...","style":"..."}';
 const SHORT_SIDE = 128;
 const ENLARGE_SHORT_SIDE = 1024;
 const ENLARGE_STRENGTH = 0.3;
@@ -533,6 +539,40 @@ async function falImageUrlFromSource({ filePath, dataUrl }) {
   throw new Error("Drop an image onto the prompt to describe it.");
 }
 
+async function storedPromptFor(filename) {
+  const base = path.basename(String(filename ?? ""));
+  if (!base) return null;
+  const subject = await rememberedPart(base, "subject");
+  const style = await rememberedPart(base, "style");
+  if (!subject || !style) return null;
+  return { filename: base, subject, style };
+}
+
+async function combinePromptsLocal(entries) {
+  const blocks = entries.flatMap((entry, index) => [
+    `Prompt ${index + 1} subject:`,
+    entry.subject,
+    "",
+    `Prompt ${index + 1} style:`,
+    entry.style,
+    "",
+  ]);
+  const output = await jobQueue.runText(async () => {
+    await textLlm.load();
+    return localText(
+      [...blocks, "Fuse these into one new subject and one new style."].join("\n"),
+      COMBINE_TEXT_SYSTEM_PROMPT,
+      { temperature: 0.55, action: "combine" },
+    );
+  });
+  const parsed = parseRevisedPrompt(output);
+  const fused = expandPromptParts(parsed.subject, parsed.style);
+  if (!combinePrompt(fused.subject, fused.style)) {
+    throw new Error("The combined prompt was empty.");
+  }
+  return fused;
+}
+
 async function describeWithFal({ filePath, dataUrl, images, part }) {
   const task = part === "style" ? "style" : "subject";
   const sources =
@@ -838,6 +878,16 @@ function cancelledError() {
   return Object.assign(new Error("Generation cancelled."), { cancelled: true });
 }
 
+const liveChildren = new Set();
+
+function trackChild(child) {
+  liveChildren.add(child);
+  const done = () => liveChildren.delete(child);
+  child.once("close", done);
+  child.once("exit", done);
+  return child;
+}
+
 function killChild(child) {
   if (!child || child.killed || child.exitCode != null) return;
   try {
@@ -845,7 +895,7 @@ function killChild(child) {
   } catch {
     // Process may already be gone.
   }
-  setTimeout(() => {
+  const timer = setTimeout(() => {
     if (child.killed || child.exitCode != null) return;
     try {
       child.kill("SIGKILL");
@@ -853,14 +903,26 @@ function killChild(child) {
       // Process may already be gone.
     }
   }, 1200);
+  timer.unref();
+}
+
+function killAllChildren() {
+  for (const child of liveChildren) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Process may already be gone.
+    }
+  }
+  liveChildren.clear();
 }
 
 function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const child = trackChild(spawn(command, args, {
       cwd: options.cwd ?? __dirname,
       env: process.env,
-    });
+    }));
     let stdout = "";
     let stderr = "";
     const onAbort = () => {
@@ -995,7 +1057,7 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
 
   const runWithPty = () =>
     new Promise((resolve, reject) => {
-      const child = spawn("python3", ["-u", "-c", PTY_WRAPPER, "draw-things-cli", ...previewArgs], {
+      const child = trackChild(spawn("python3", ["-u", "-c", PTY_WRAPPER, "draw-things-cli", ...previewArgs], {
         cwd: __dirname,
         env: {
           ...process.env,
@@ -1005,7 +1067,7 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
           LINES: "24",
           PYTHONUNBUFFERED: "1",
         },
-      });
+      }));
       const iterm = { buf: "" };
       let stdout = "";
       let stderr = "";
@@ -1090,7 +1152,7 @@ class MlxWorker {
       throw new Error("python/worker.py is missing.");
     });
 
-    const child = spawn(PYTHON, ["-u", WORKER_SCRIPT], {
+    const child = trackChild(spawn(PYTHON, ["-u", WORKER_SCRIPT], {
       cwd: __dirname,
       env: {
         ...process.env,
@@ -1099,7 +1161,7 @@ class MlxWorker {
         HF_XET_HIGH_PERFORMANCE: "1",
       },
       stdio: ["pipe", "pipe", "pipe"],
-    });
+    }));
     this.proc = child;
     this.alive = true;
 
@@ -1783,9 +1845,10 @@ function describeItemFromBody(item) {
   const dataUrl = String(item?.image ?? item?.dataUrl ?? "").trim();
   const parsed = dataUrl ? parseImageDataUrl(dataUrl) : null;
   const filePath = resolveExistingFile(item?.filename);
-  if (!parsed && !filePath) return null;
+  const filename = filePath ? path.basename(filePath) : safeBasename(item?.filename);
+  if (!parsed && !filePath && !filename) return null;
   return {
-    filename: filePath ? path.basename(filePath) : "",
+    filename,
     filePath,
     parsed,
   };
@@ -1820,6 +1883,24 @@ app.post("/api/describe", async (req, res) => {
       });
       if (item.filename) await rememberImageDescription(item.filename, described);
       res.json({ ...described, model: FAL_DESCRIBE_MODEL });
+      return;
+    }
+    const stored = [];
+    for (const item of items) {
+      const prompt = await storedPromptFor(item.filename);
+      if (!prompt) {
+        stored.length = 0;
+        break;
+      }
+      stored.push(prompt);
+    }
+    if (stored.length === items.length) {
+      const fused = await combinePromptsLocal(stored);
+      res.json({ ...fused, model: TEXT_MODEL_ID, combined: items.length, local: true });
+      return;
+    }
+    if (items.some((item) => !item.parsed && !item.filePath)) {
+      res.status(400).json({ error: "Drop an image onto the prompt to describe it." });
       return;
     }
     const described = await describeWithFal({
@@ -1927,7 +2008,7 @@ function queueLibraryRefresh(filename) {
 }
 
 await ensureDirs();
-watch(GENERATED_DIR, (eventType, filename) => {
+const generatedWatch = watch(GENERATED_DIR, (eventType, filename) => {
   queueLibraryRefresh(filename);
 });
 
@@ -1953,12 +2034,43 @@ const server = app.listen(PORT, () => {
   refreshKleinAvailability().catch(() => {});
 });
 
-function shutdown() {
-  textLlm.unload().catch(() => {});
-  worker.stop();
-  canvasBuild.dispose();
-  server.close();
+function endSseClients(clients) {
+  for (const res of clients) {
+    try {
+      res.end();
+    } catch {
+      // Already closed.
+    }
+  }
+  clients.clear();
 }
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+let shuttingDown = false;
+function shutdown(signal = "signal") {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[klein] shutting down (${signal})`);
+  jobQueue.cancelAll();
+  killAllChildren();
+  endSseClients(watchClients);
+  endSseClients(modelClients);
+  clearTimeout(watchTimer);
+  try {
+    generatedWatch.close();
+  } catch {
+    // Watcher may already be closed.
+  }
+  worker.stop();
+  textLlm.unload().catch(() => {});
+  canvasBuild.dispose().catch(() => {});
+  try {
+    server.closeAllConnections();
+  } catch {
+    // Older Node without closeAllConnections.
+  }
+  server.close(() => {});
+  setTimeout(() => process.exit(0), 300).unref();
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
