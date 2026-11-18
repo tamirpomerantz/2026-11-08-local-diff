@@ -115,6 +115,28 @@ class LocalTextLlm {
     });
   }
 
+  /** Free-form text completion — no JSON grammar constraint. */
+  async completeText({ systemPrompt, userPrompt, temperature = 0.4, maxTokens = 256 } = {}) {
+    return this.withLock(async () => {
+      await this.load();
+      const sequence = this.context.getSequence();
+      const session = new LlamaChatSession({
+        contextSequence: sequence,
+        systemPrompt,
+        autoDisposeSequence: true,
+      });
+      try {
+        return await session.prompt(userPrompt, {
+          temperature,
+          maxTokens,
+          // No grammar — free-form plain text output
+        });
+      } finally {
+        await session.dispose({ disposeSequence: true });
+      }
+    });
+  }
+
   async unload() {
     return this.withLock(() => this._unload());
   }

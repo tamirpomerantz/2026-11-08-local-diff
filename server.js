@@ -114,7 +114,16 @@ const SHORT_SIDE = 128;
 const ENLARGE_LONG_SIDE = 1024;
 const ENLARGE_STRENGTH = 1;
 const ENLARGE_PROMPT =
-  "Preserve the exact materials, composition, shapes, colors and lighting. Reconstruct natural fine surface details, subtle material texture, realistic micro-texture and organic imperfections.";
+  "Upscale to crisp photorealistic high resolution, sharp focus, clean edges, deblurred, textured. Strictly preserve the exact original color palette, hue, saturation, contrast, lighting, and surface finish without adding new textures or altering style.";
+const ENLARGE_SYSTEM_PROMPT =
+  "You write custom upscale prompts for an image diffusion model.\n" +
+  "Your task: Read the image description, identify what concrete objects and surfaces are in the scene, and specify the realistic textures and materials of ONLY those objects.\n\n" +
+  "STRICT CONSTRAINTS:\n" +
+  "- ONLY name materials and textures that belong to the objects present in this image (such as the coat of an animal, skin/hair of a person, metal/glass of a machine or accessory, etc.).\n" +
+  "- ABSOLUTELY NEVER mention materials not found in the scene. If there is no animal, do not mention fur. If there is no person, do not mention human skin. If there is no plant, do not mention foliage. If there is no water, do not mention water. Do not list generic materials unless they explicitly appear in the scene.\n" +
+  "- Template:\n" +
+  "\"Upscale to crisp photorealistic high resolution, sharp focus, clean edges, deblurred. Reconstruct fine natural surface details and realistic micro-textures for [the concrete objects and their materials from this image]. Strictly preserve the exact original color palette, hue, saturation, contrast, lighting, and surface finish without adding new textures or altering style.\"\n" +
+  "- Output ONLY the prompt text. No quotes, no explanations, no preamble.";
 const execFileAsync = promisify(execFile);
 const PORT = Number(process.env.PORT ?? 3456);
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
@@ -436,6 +445,76 @@ async function localText(prompt, systemPrompt = REVISE_SYSTEM_PROMPT, { temperat
   );
   if (!text) throw new Error("The local text model returned an empty prompt.");
   return text;
+}
+
+async function localFreeText(prompt, systemPrompt, { temperature = 0.2, maxTokens = 320, action = "text" } = {}) {
+  logModelCall("local", TEXT_MODEL_ID, action);
+  const text = cleanDescribeText(
+    await textLlm.completeText({
+      systemPrompt,
+      userPrompt: prompt,
+      temperature,
+      maxTokens,
+    }),
+  );
+  if (!text) throw new Error("The local text model returned empty text.");
+  return text;
+}
+
+function formatEnlargeDescriptionPrompt(subject, style) {
+  const parts = [];
+  if (subject) parts.push(`Subject: ${subject}`);
+  if (style) parts.push(`Style: ${style}`);
+  return [
+    "Image description:",
+    ...parts,
+    "",
+    "Rewrite the upscale prompt specifically tailored to the materials and textures in this image:",
+  ].join("\n");
+}
+
+async function generateEnlargePrompt({ subject, style } = {}) {
+  const cleanSubject = String(subject ?? "").trim();
+  const cleanStyle = String(style ?? "").trim();
+  if (!cleanSubject && !cleanStyle) {
+    return ENLARGE_PROMPT;
+  }
+  const promptInput = formatEnlargeDescriptionPrompt(cleanSubject, cleanStyle);
+  try {
+    const customPrompt = await localFreeText(promptInput, ENLARGE_SYSTEM_PROMPT, {
+      temperature: 0.1,
+      maxTokens: 320,
+      action: "enlarge-prompt",
+    });
+    return customPrompt || (cleanStyle ? `${ENLARGE_PROMPT} ${cleanStyle}` : ENLARGE_PROMPT);
+  } catch (error) {
+    console.warn(`[klein enlarge] Failed to generate custom prompt: ${error?.message || error}`);
+    return cleanStyle ? `${ENLARGE_PROMPT} ${cleanStyle}` : ENLARGE_PROMPT;
+  }
+}
+
+async function resolveEnlargeDescription(job) {
+  if (job.initPath) {
+    const sourceBase = path.basename(job.initPath);
+    let subject = (await rememberedPart(sourceBase, "subject")).trim();
+    let style = (await rememberedPart(sourceBase, "style")).trim();
+
+    if (!subject || !style) {
+      job.send?.({ type: "status", message: `Describing image with fal (${FAL_DESCRIBE_MODEL})…` });
+      const desc = await ensureImageDescription(sourceBase, job.initPath, subject, style);
+      subject = desc.subject;
+      style = desc.style;
+    }
+    job.subject = subject;
+    job.style = style;
+    return { subject, style };
+  }
+
+  const expanded = expandPromptParts(job.subject, job.style);
+  return {
+    subject: expanded.subject ? expanded.subject.trim() : "",
+    style: expanded.style ? expanded.style.trim() : "",
+  };
 }
 
 async function rewriteQueuedJob(job) {
@@ -835,7 +914,13 @@ async function rememberImageDescription(filename, { subject, style }) {
   await enqueueManifest(async () => {
     const manifest = await readManifest();
     const index = manifest.findIndex((item) => item.filename === base);
-    const current = index >= 0 ? manifest[index] : { filename: base, createdAt: new Date().toISOString() };
+    let current = index >= 0 ? manifest[index] : { filename: base, createdAt: new Date().toISOString() };
+    if (!current.width || !current.height) {
+      try {
+        const size = await imageSize(path.join(GENERATED_DIR, base));
+        current = { ...current, width: size.width, height: size.height };
+      } catch {}
+    }
     const merged = {
       ...current,
       ...(nextSubject ? { subject: nextSubject } : {}),
@@ -846,6 +931,56 @@ async function rememberImageDescription(filename, { subject, style }) {
     await writeManifest(manifest);
   });
   broadcastLibrary();
+}
+
+async function ensureImageDescription(filename, filePath, existingSubject = "", existingStyle = "") {
+  let subject = String(existingSubject ?? "").trim();
+  let style = String(existingStyle ?? "").trim();
+  const base = path.basename(String(filename || filePath || ""));
+
+  if (base) {
+    if (!subject) subject = (await rememberedPart(base, "subject")).trim();
+    if (!style) style = (await rememberedPart(base, "style")).trim();
+  }
+
+  if (subject && style) {
+    return { subject, style };
+  }
+
+  if (filePath) {
+    logModelCall("fal", FAL_DESCRIBE_MODEL, "describe-enlarge-missing");
+    const tasks = [];
+    if (!subject) {
+      tasks.push(
+        describeWithFal({ filePath, part: "subject" })
+          .then((res) => {
+            if (res?.subject) subject = String(res.subject).trim();
+          })
+          .catch((err) => {
+            console.warn(`[klein enlarge] fal describe subject failed: ${err.message || err}`);
+          }),
+      );
+    }
+    if (!style) {
+      tasks.push(
+        describeWithFal({ filePath, part: "style" })
+          .then((res) => {
+            if (res?.style) style = String(res.style).trim();
+          })
+          .catch((err) => {
+            console.warn(`[klein enlarge] fal describe style failed: ${err.message || err}`);
+          }),
+      );
+    }
+    await Promise.all(tasks);
+
+    if (base && (subject || style)) {
+      await rememberImageDescription(base, { subject, style });
+      console.log(`[klein enlarge] Documented description in manifest.json for ${base} → subject: ${subject ? `"${subject.slice(0, 50)}…"` : "(none)"}, style: ${style ? `"${style.slice(0, 50)}…"` : "(none)"}`);
+    }
+  }
+
+  return { subject, style };
 }
 
 const DEFAULT_CANVAS = { viewport: { x: 0, y: 0, zoom: 1 }, positions: {} };
@@ -1404,16 +1539,31 @@ async function runKleinGenerate(job) {
     send,
   } = job;
   const expanded = expandPromptParts(subject, style);
-  let enlargeStyle = expanded.style ? expanded.style.trim() : "";
-  let enlargeSubject = expanded.subject ? expanded.subject.trim() : "";
+  let enlargeStyle = "";
+  let enlargeSubject = "";
   if (initPath) {
     const sourceBase = path.basename(initPath);
-    if (!enlargeStyle) enlargeStyle = (await rememberedPart(sourceBase, "style")).trim();
-    if (!enlargeSubject) enlargeSubject = (await rememberedPart(sourceBase, "subject")).trim();
+    enlargeStyle = (await rememberedPart(sourceBase, "style")).trim();
+    enlargeSubject = (await rememberedPart(sourceBase, "subject")).trim();
+    if (!enlargeSubject || !enlargeStyle) {
+      const desc = await ensureImageDescription(sourceBase, initPath, enlargeSubject, enlargeStyle);
+      enlargeSubject = desc.subject;
+      enlargeStyle = desc.style;
+    }
+  } else {
+    enlargeSubject = expanded.subject ? expanded.subject.trim() : "";
+    enlargeStyle = expanded.style ? expanded.style.trim() : "";
   }
-  const prompt = initPath
-    ? (enlargeStyle ? `${ENLARGE_PROMPT} ${enlargeStyle}` : ENLARGE_PROMPT)
-    : combinePrompt(expanded.subject, expanded.style);
+  let prompt;
+  if (initPath) {
+    if (job.enlargePrompt) {
+      prompt = job.enlargePrompt;
+    } else {
+      prompt = await generateEnlargePrompt({ subject: enlargeSubject, style: enlargeStyle });
+    }
+  } else {
+    prompt = combinePrompt(expanded.subject, expanded.style);
+  }
   if (!prompt) throw new Error("Add a subject or style first.");
   if (initPath) {
     console.log(`[klein enlarge] style brief → ${enlargeStyle || "(none)"}`);
@@ -1496,8 +1646,8 @@ async function runKleinGenerate(job) {
     const actualSize = await imageSize(outputPath).catch(() => ({ width, height }));
     const entry = {
       filename,
-      subject: expanded.subject || enlargeSubject || "",
-      style: expanded.style || enlargeStyle || "",
+      subject: initPath ? enlargeSubject : (expanded.subject || ""),
+      style: initPath ? enlargeStyle : (expanded.style || ""),
       seed,
       steps: initPath ? 4 : steps,
       sampler: sampler.id,
@@ -1515,6 +1665,12 @@ async function runKleinGenerate(job) {
     await writeManifest(manifest);
     setKleinState({ loaded: true, action: "idle", percent: 100, message: "Draw Things" });
     console.log(`[klein generate] wrote ${filename} ${width}x${height}`);
+    // If this is a normal generate (non-enlarge) with no description, describe it in the background.
+    if (!initPath && (!entry.subject || !entry.style)) {
+      ensureImageDescription(filename, outputPath, entry.subject, entry.style).catch((err) => {
+        console.warn(`[klein generate] background describe failed for ${filename}: ${err.message || err}`);
+      });
+    }
     send({
       type: "done",
       image: { ...entry, url: `/generated/${encodeURIComponent(filename)}` },
@@ -1543,14 +1699,25 @@ const jobQueue = createJobQueue({
     await textLlm.load();
     for (const job of jobs) {
       if (job.cancelled) continue;
-      job.send({ type: "status", message: `Rewriting with ${TEXT_MODEL_ID}` });
       try {
-        const revised = await rewriteQueuedJob(job);
-        if (job.cancelled) continue;
-        job.subject = revised.subject;
-        job.style = revised.style;
+        if (job.rewrite) {
+          job.send({ type: "status", message: `Rewriting with ${TEXT_MODEL_ID}` });
+          const revised = await rewriteQueuedJob(job);
+          if (job.cancelled) continue;
+          job.subject = revised.subject;
+          job.style = revised.style;
+        }
+        if (job.initPath) {
+          job.send({ type: "status", message: `Customizing upscale prompt with ${TEXT_MODEL_ID}…` });
+          const desc = await resolveEnlargeDescription(job);
+          job.enlargePrompt = await generateEnlargePrompt(desc);
+          if (job.cancelled) continue;
+        }
         job.stage = "generate";
-        job.send({ type: "status", message: "Prompt ready. Waiting for Klein…" });
+        job.send({
+          type: "status",
+          message: job.initPath ? "Prompt ready. Waiting for Draw Things…" : "Prompt ready. Waiting for Klein…",
+        });
       } catch (error) {
         job.stage = "done";
         job.send({
@@ -1587,8 +1754,8 @@ async function enqueueStudioJob(req, res, { rewrite = null, action = "generate" 
   const initPath = mode === "enlarge" ? resolveExistingFile(req.body?.image) : null;
   if (initPath) {
     const sourceBase = path.basename(initPath);
-    if (!subject) subject = await rememberedPart(sourceBase, "subject");
-    if (!style) style = await rememberedPart(sourceBase, "style");
+    subject = (await rememberedPart(sourceBase, "subject")).trim();
+    style = (await rememberedPart(sourceBase, "style")).trim();
   }
   let aspect = String(req.body?.aspect ?? "1:1");
   if (initPath && (!req.body?.aspect || req.body.aspect === "1:1")) {
@@ -1641,7 +1808,7 @@ async function enqueueStudioJob(req, res, { rewrite = null, action = "generate" 
     id: String(req.body?.id || randomUUID()),
     clientId: String(req.body?.id || ""),
     action: rewriteAction || (initPath ? "enlarge" : action),
-    stage: rewriteAction ? "rewrite" : "generate",
+    stage: rewriteAction || initPath ? "rewrite" : "generate",
     rewrite: rewriteAction
       ? {
           action: rewriteAction,
@@ -1769,7 +1936,7 @@ app.post("/api/debug-log", async (req, res) => {
     return;
   }
   const line = `${JSON.stringify(entry)}\n`;
-  await fs.appendFile(DEBUG_LOG_PATH, line).catch(() => {});
+  // await fs.appendFile(DEBUG_LOG_PATH, line).catch(() => {});
   console.log(`[klein ${entry.source}] ${entry.message}${entry.data != null ? ` ${JSON.stringify(entry.data)}` : ""}`);
   res.json({ ok: true });
 });
@@ -2107,7 +2274,63 @@ const server = app.listen(PORT, () => {
   console.log(`fal describe: ${FAL_DESCRIBE_MODEL}`);
   console.log(`Watching ${GENERATED_DIR}`);
   refreshKleinAvailability().catch(() => {});
+  // Backfill descriptions for all existing images that are missing subject or style.
+  backfillDescriptions().catch((err) => {
+    console.warn(`[klein backfill] error: ${err.message || err}`);
+  });
 });
+
+async function backfillDescriptions() {
+  // Give the server a moment to fully start before hitting fal.
+  await new Promise((r) => setTimeout(r, 3000));
+  let names;
+  try {
+    names = (await fs.readdir(GENERATED_DIR)).filter(
+      (name) => !name.startsWith(".") && IMAGE_EXTS.has(path.extname(name).toLowerCase()),
+    );
+  } catch {
+    return;
+  }
+  const manifest = await readManifest();
+  const byFile = new Map(manifest.map((e) => [e.filename, e]));
+  let count = 0;
+  for (const filename of names) {
+    const meta = byFile.get(filename) ?? {};
+    const existing = descriptionParts(meta);
+    // First try chain-walking manifest (source → source → …) for inherited descriptions.
+    let subject = existing.subject || (await rememberedPart(filename, "subject"));
+    let style = existing.style || (await rememberedPart(filename, "style"));
+    if (subject && style) {
+      // Persist if we inherited something that wasn't saved directly on this entry.
+      if (!existing.subject || !existing.style) {
+        await rememberImageDescription(filename, { subject, style });
+        console.log(`[klein backfill] inherited description for ${filename}`);
+        count++;
+      }
+      continue;
+    }
+    // Still missing something — call fal to describe the actual image file.
+    const filePath = path.join(GENERATED_DIR, filename);
+    try {
+      await fs.access(filePath);
+    } catch {
+      continue; // File doesn't exist on disk, skip.
+    }
+    try {
+      const desc = await ensureImageDescription(filename, filePath, subject, style);
+      if (desc.subject || desc.style) {
+        console.log(`[klein backfill] described ${filename} via fal`);
+        count++;
+      }
+    } catch (err) {
+      console.warn(`[klein backfill] fal failed for ${filename}: ${err.message || err}`);
+    }
+    // Throttle: 1 image per 2 seconds so we don't hammer fal during active use.
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  if (count > 0) console.log(`[klein backfill] done — updated ${count} image(s)`);
+  else console.log(`[klein backfill] all images already have descriptions`);
+}
 
 function endSseClients(clients) {
   for (const res of clients) {

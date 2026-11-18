@@ -801,8 +801,8 @@ function enlargeCanvasImage(image, nodeId) {
   const known = images.find((item) => item.filename === image.filename) ?? image;
   const sized = sizeForLongSide(known.width, known.height);
   const parts = descriptionOf(known);
-  const activeStyle = (parts.style || styleText() || "").trim();
-  const activeSubject = (parts.subject || subjectText() || "").trim();
+  const activeStyle = String(parts.style || "").trim();
+  const activeSubject = String(parts.subject || "").trim();
   const job = {
     id: `job-${++jobSeq}-${Date.now()}`,
     slotId: `enlarge-${jobSeq}`,
