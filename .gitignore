@@ -7,8 +7,7 @@ public/canvas.js.map
 models
 python/__pycache__
 *.pyc
-generated/*.png
-generated/*.json
+generated
 .env
 .DS_Store
 klein-debug.log
