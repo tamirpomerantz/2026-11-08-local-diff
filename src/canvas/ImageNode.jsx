@@ -6,6 +6,8 @@ export function ImageNode({ id, data, selected }) {
   const image = data?.image;
   const generating = Boolean(data?.generating);
   const exiting = Boolean(data?.exiting);
+  const progress = data?.progress;
+  const isEnlarge = data?.mode === "enlarge" || image?.mode === "enlarge";
   const width = nodeWidth(image);
   const height = nodeHeight(image);
   const hasImage = Boolean(image?.url);
@@ -21,6 +23,21 @@ export function ImageNode({ id, data, selected }) {
         ) : generating ? (
           <span className="canvas-image-aspect">{image?.aspect || ""}</span>
         ) : null}
+        {generating && (
+          <div className="canvas-image-generating-overlay">
+            {hasImage && <div className="canvas-image-generating-shimmer" />}
+            <div className="canvas-image-generating-badge">
+              <span className="canvas-image-generating-spinner" />
+              <span>
+                {progress?.total
+                  ? `${isEnlarge ? "Upscaling" : "Generating"} ${progress.step}/${progress.total}`
+                  : isEnlarge
+                    ? "Upscaling…"
+                    : "Generating…"}
+              </span>
+            </div>
+          </div>
+        )}
         {exiting ? null : (
           <button
             type="button"

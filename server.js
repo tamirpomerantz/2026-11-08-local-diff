@@ -114,7 +114,7 @@ const SHORT_SIDE = 128;
 const ENLARGE_LONG_SIDE = 1024;
 const ENLARGE_STRENGTH = 1;
 const ENLARGE_PROMPT =
-  "Preserve the exact composition, shapes, colors and lighting. Reconstruct natural fine surface details, subtle material texture, realistic micro-texture and organic imperfections. Maintain the original visual character.";
+  "Preserve the exact materials, composition, shapes, colors and lighting. Reconstruct natural fine surface details, subtle material texture, realistic micro-texture and organic imperfections.";
 const execFileAsync = promisify(execFile);
 const PORT = Number(process.env.PORT ?? 3456);
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
@@ -811,12 +811,20 @@ function expandPromptParts(subject, style) {
 }
 
 async function rememberedPart(filename, part) {
-  const base = path.basename(String(filename ?? ""));
+  let current = path.basename(String(filename ?? ""));
   const task = part === "style" ? "style" : "subject";
-  if (!base) return "";
+  if (!current) return "";
   const manifest = await readManifest();
-  const parts = descriptionParts(manifest.find((item) => item.filename === base));
-  return parts[task];
+  const visited = new Set();
+  while (current && !visited.has(current)) {
+    visited.add(current);
+    const item = manifest.find((entry) => entry.filename === current);
+    if (!item) break;
+    const parts = descriptionParts(item);
+    if (parts[task]) return parts[task];
+    current = item.source ? path.basename(item.source) : "";
+  }
+  return "";
 }
 
 async function rememberImageDescription(filename, { subject, style }) {
@@ -1045,7 +1053,7 @@ function consumeITermImages(state, chunk, onPng) {
   }
 }
 
-function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onProgress, signal }) {
+function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onProgress, signal, logDetails }) {
   const previewArgs = [
     ...args,
     "--output",
@@ -1057,6 +1065,11 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
   ];
   const fallbackArgs = [...args, "--output", outputPath, "--disable-preview", "--no-download-missing"];
   if (signal?.aborted) return Promise.reject(cancelledError());
+
+  console.log(`[draw-things-cli] spawn: draw-things-cli ${previewArgs.map((a) => (a.includes(" ") ? `"${a}"` : a)).join(" ")}`);
+  if (logDetails) {
+    console.log(`[draw-things-cli] parameters:`, JSON.stringify(logDetails, null, 2));
+  }
 
   const runWithPty = () =>
     new Promise((resolve, reject) => {
@@ -1075,6 +1088,7 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
       let stdout = "";
       let stderr = "";
       let frames = 0;
+      let lastReportedStep = -1;
       let writing = Promise.resolve();
       const onAbort = () => killChild(child);
       if (signal?.aborted) onAbort();
@@ -1083,7 +1097,14 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
         const text = chunk.toString("utf8");
         stdout += text;
         const progress = parseSamplingProgress(text.replace(/\r/g, "\n"));
-        if (progress) onProgress?.(progress);
+        if (progress) {
+          if (progress.step !== lastReportedStep) {
+            lastReportedStep = progress.step;
+            const pct = Math.max(4, Math.round((progress.step / progress.total) * 100));
+            console.log(`[draw-things-cli] sampling progress: step ${progress.step}/${progress.total} (${pct}%)`);
+          }
+          onProgress?.(progress);
+        }
         consumeITermImages(iterm, chunk, (png) => {
           writing = writing.then(async () => {
             frames += 1;
@@ -1108,15 +1129,19 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
         if (code === 0) {
           const exists = await fs.access(outputPath).then(() => true).catch(() => false);
           if (exists) {
+            const size = await imageSize(outputPath).catch(() => null);
+            console.log(`[draw-things-cli] completed successfully. Output wrote ${outputPath}${size ? ` (${size.width}x${size.height})` : ""}`);
             resolve({ stdout, stderr, frames });
             return;
           }
           if (frames > 0) {
             await fs.copyFile(previewPath, outputPath);
+            console.log(`[draw-things-cli] completed with preview frame. Output wrote ${outputPath}`);
             resolve({ stdout, stderr, frames });
             return;
           }
         }
+        console.error(`[draw-things-cli] exited with code ${code}`);
         reject(Object.assign(new Error((stderr || stdout).trim() || `draw-things-cli exited ${code}`), { frames }));
       });
     });
@@ -1391,6 +1416,7 @@ async function runKleinGenerate(job) {
     : combinePrompt(expanded.subject, expanded.style);
   if (!prompt) throw new Error("Add a subject or style first.");
   if (initPath) {
+    console.log(`[klein enlarge] style brief → ${enlargeStyle || "(none)"}`);
     console.log(`[klein enlarge] prompt → ${prompt}`);
   } else if (expanded.subject !== (subject ?? "") || expanded.style !== (style ?? "")) {
     console.log(`[klein generate] tokens → ${prompt}`);
@@ -1434,6 +1460,20 @@ async function runKleinGenerate(job) {
       ],
       outputPath,
       previewPath,
+      logDetails: {
+        mode: initPath ? "enlarge" : "generate",
+        model: MODEL,
+        width,
+        height,
+        prompt,
+        style: initPath ? enlargeStyle : expanded.style,
+        subject: initPath ? enlargeSubject : expanded.subject,
+        strength: initPath ? strength : null,
+        imageInput: initPath ? initResizedPath : null,
+        steps: initPath ? 4 : steps,
+        seed,
+        output: outputPath,
+      },
       onPreview: () => {
         send({ type: "preview", url: `/preview/${previewName}?t=${Date.now()}` });
       },

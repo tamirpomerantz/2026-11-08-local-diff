@@ -229,6 +229,7 @@ function toGeneratingNode(slot, position) {
     aspect: slot.aspect,
     scale: slot.scale || 1,
     url: slot.url || null,
+    mode: slot.mode || "generate",
   };
   return {
     id: generatingId(slot.id),
@@ -237,6 +238,7 @@ function toGeneratingNode(slot, position) {
     data: {
       generating: true,
       slotId: slot.id,
+      mode: slot.mode || "generate",
       image,
     },
     style: { width: nodeWidth(image) },
@@ -549,6 +551,13 @@ export function ImageCanvas() {
         image: { ...data.image, url },
       }));
     };
+    const onGenerateProgress = (event) => {
+      const { id, step, total, mode } = event.detail || {};
+      if (id == null) return;
+      patchGenerating(id, () => ({
+        progress: { step, total, mode },
+      }));
+    };
     const onGenerateDone = (event) => {
       const slotId = event.detail?.id;
       const image = event.detail?.image;
@@ -590,6 +599,7 @@ export function ImageCanvas() {
 
     window.addEventListener("klein:images", onImages);
     window.addEventListener("klein:generate-start", onGenerateStart);
+    window.addEventListener("klein:generate-progress", onGenerateProgress);
     window.addEventListener("klein:generate-preview", onGeneratePreview);
     window.addEventListener("klein:generate-done", onGenerateDone);
     window.addEventListener("klein:generate-error", onGenerateError);
@@ -598,6 +608,7 @@ export function ImageCanvas() {
       ignore = true;
       window.removeEventListener("klein:images", onImages);
       window.removeEventListener("klein:generate-start", onGenerateStart);
+      window.removeEventListener("klein:generate-progress", onGenerateProgress);
       window.removeEventListener("klein:generate-preview", onGeneratePreview);
       window.removeEventListener("klein:generate-done", onGenerateDone);
       window.removeEventListener("klein:generate-error", onGenerateError);

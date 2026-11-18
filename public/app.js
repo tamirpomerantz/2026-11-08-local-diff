@@ -801,6 +801,8 @@ function enlargeCanvasImage(image, nodeId) {
   const known = images.find((item) => item.filename === image.filename) ?? image;
   const sized = sizeForLongSide(known.width, known.height);
   const parts = descriptionOf(known);
+  const activeStyle = (parts.style || styleText() || "").trim();
+  const activeSubject = (parts.subject || subjectText() || "").trim();
   const job = {
     id: `job-${++jobSeq}-${Date.now()}`,
     slotId: `enlarge-${jobSeq}`,
@@ -808,8 +810,8 @@ function enlargeCanvasImage(image, nodeId) {
     width: sized.width,
     height: sized.height,
     scale: 2,
-    subject: parts.subject,
-    style: parts.style,
+    subject: activeSubject,
+    style: activeStyle,
     steps: selectedSteps(),
     sampler: resolveSampler(),
     source: known.filename,
@@ -835,6 +837,7 @@ function enlargeCanvasImage(image, nodeId) {
             height: job.height,
             scale: 2,
             url: known.url,
+            mode: "enlarge",
           },
         ],
       },
@@ -1718,6 +1721,16 @@ async function runGenerateJob(job) {
           job.aspect,
           `${event.step}/${event.total}`,
           job.mode === "enlarge" ? "Enlarging" : "Generating",
+        );
+        window.dispatchEvent(
+          new CustomEvent("klein:generate-progress", {
+            detail: {
+              id: job.id,
+              step: event.step,
+              total: event.total,
+              mode: job.mode || "generate",
+            },
+          }),
         );
       } else if (event.type === "status") {
         statusEl.textContent = event.message || statusEl.textContent;
