@@ -111,9 +111,10 @@ const COMBINE_TEXT_SYSTEM_PROMPT =
   "Subject is who or what is depicted and how they are posed. Style is medium, palette, light, and mood only. " +
   'Reply with JSON only: {"subject":"...","style":"..."}';
 const SHORT_SIDE = 128;
-const ENLARGE_SHORT_SIDE = 1024;
-const ENLARGE_STRENGTH = 0.3;
-const ENLARGE_PROMPT = "highly detailed, sharp natural textures, refined surfaces";
+const ENLARGE_LONG_SIDE = 1024;
+const ENLARGE_STRENGTH = 1;
+const ENLARGE_PROMPT =
+  "Preserve the exact composition, shapes, colors and lighting. Reconstruct natural fine surface details, subtle material texture, realistic micro-texture and organic imperfections. Maintain the original visual character.";
 const execFileAsync = promisify(execFile);
 const PORT = Number(process.env.PORT ?? 3456);
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
@@ -234,10 +235,10 @@ function snap64(value, min = SHORT_SIDE) {
   return Math.max(min, Math.round(value / 64) * 64);
 }
 
-function sizeForShortSide(width, height, shortSide = ENLARGE_SHORT_SIDE) {
+function sizeForLongSide(width, height, longSide = ENLARGE_LONG_SIDE) {
   const w = Math.max(1, Number(width) || 1);
   const h = Math.max(1, Number(height) || 1);
-  const scale = shortSide / Math.min(w, h);
+  const scale = longSide / Math.max(w, h);
   return {
     width: snap64(w * scale, 64),
     height: snap64(h * scale, 64),
@@ -1047,6 +1048,8 @@ function consumeITermImages(state, chunk, onPng) {
 function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onProgress, signal }) {
   const previewArgs = [
     ...args,
+    "--output",
+    outputPath,
     "--terminal-image",
     "--terminal-image-protocol",
     "iterm2",
@@ -1102,10 +1105,17 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
           reject(cancelledError());
           return;
         }
-        if (code === 0 && frames > 0) {
-          await fs.copyFile(previewPath, outputPath);
-          resolve({ stdout, stderr, frames });
-          return;
+        if (code === 0) {
+          const exists = await fs.access(outputPath).then(() => true).catch(() => false);
+          if (exists) {
+            resolve({ stdout, stderr, frames });
+            return;
+          }
+          if (frames > 0) {
+            await fs.copyFile(previewPath, outputPath);
+            resolve({ stdout, stderr, frames });
+            return;
+          }
         }
         reject(Object.assign(new Error((stderr || stdout).trim() || `draw-things-cli exited ${code}`), { frames }));
       });
@@ -1369,9 +1379,20 @@ async function runKleinGenerate(job) {
     send,
   } = job;
   const expanded = expandPromptParts(subject, style);
-  const prompt = combinePrompt(expanded.subject, expanded.style) || (initPath ? ENLARGE_PROMPT : "");
+  let enlargeStyle = expanded.style ? expanded.style.trim() : "";
+  let enlargeSubject = expanded.subject ? expanded.subject.trim() : "";
+  if (initPath) {
+    const sourceBase = path.basename(initPath);
+    if (!enlargeStyle) enlargeStyle = (await rememberedPart(sourceBase, "style")).trim();
+    if (!enlargeSubject) enlargeSubject = (await rememberedPart(sourceBase, "subject")).trim();
+  }
+  const prompt = initPath
+    ? (enlargeStyle ? `${ENLARGE_PROMPT} ${enlargeStyle}` : ENLARGE_PROMPT)
+    : combinePrompt(expanded.subject, expanded.style);
   if (!prompt) throw new Error("Add a subject or style first.");
-  if (expanded.subject !== (subject ?? "") || expanded.style !== (style ?? "")) {
+  if (initPath) {
+    console.log(`[klein enlarge] prompt → ${prompt}`);
+  } else if (expanded.subject !== (subject ?? "") || expanded.style !== (style ?? "")) {
     console.log(`[klein generate] tokens → ${prompt}`);
   }
   if (!(await refreshKleinAvailability())) {
@@ -1400,13 +1421,16 @@ async function runKleinGenerate(job) {
         String(width),
         "--height",
         String(height),
-        "--steps",
-        String(steps),
-        "--seed",
-        String(seed),
-        ...(initPath ? ["--image", initResizedPath, "--strength", String(strength)] : []),
-        "--config-json",
-        JSON.stringify({ sampler: sampler.id }),
+        ...(initPath
+          ? ["--image", initResizedPath, "--strength", String(strength)]
+          : [
+              "--steps",
+              String(steps),
+              "--seed",
+              String(seed),
+              "--config-json",
+              JSON.stringify({ sampler: sampler.id }),
+            ]),
       ],
       outputPath,
       previewPath,
@@ -1429,17 +1453,18 @@ async function runKleinGenerate(job) {
       signal: abort.signal,
     });
     if (abort.signal.aborted || job.cancelled) throw cancelledError();
+    const actualSize = await imageSize(outputPath).catch(() => ({ width, height }));
     const entry = {
       filename,
-      subject: expanded.subject,
-      style: expanded.style,
+      subject: expanded.subject || enlargeSubject || "",
+      style: expanded.style || enlargeStyle || "",
       seed,
-      steps,
+      steps: initPath ? 4 : steps,
       sampler: sampler.id,
       aspect,
       createdAt: new Date().toISOString(),
-      width,
-      height,
+      width: actualSize.width || width,
+      height: actualSize.height || height,
       scale: initPath ? 2 : 1,
       strength: strength ?? null,
       model: MODEL,
@@ -1516,11 +1541,21 @@ async function enqueueStudioJob(req, res, { rewrite = null, action = "generate" 
     res.status(400).json({ error: "Unknown rewrite action." });
     return;
   }
-  const subject = String(req.body?.subject ?? rewrite?.subject ?? "").trim();
-  const style = String(req.body?.style ?? rewrite?.style ?? "").trim();
+  let subject = String(req.body?.subject ?? rewrite?.subject ?? "").trim();
+  let style = String(req.body?.style ?? rewrite?.style ?? "").trim();
   const mode = String(req.body?.mode ?? "");
   const initPath = mode === "enlarge" ? resolveExistingFile(req.body?.image) : null;
-  const aspect = String(req.body?.aspect ?? "1:1");
+  if (initPath) {
+    const sourceBase = path.basename(initPath);
+    if (!subject) subject = await rememberedPart(sourceBase, "subject");
+    if (!style) style = await rememberedPart(sourceBase, "style");
+  }
+  let aspect = String(req.body?.aspect ?? "1:1");
+  if (initPath && (!req.body?.aspect || req.body.aspect === "1:1")) {
+    const manifest = await readManifest();
+    const sourceMeta = manifest.find((item) => item.filename === path.basename(initPath));
+    if (sourceMeta?.aspect) aspect = sourceMeta.aspect;
+  }
   const ratio = findRatio(aspect);
   if (mode === "enlarge" && !initPath) {
     res.status(400).json({ error: "Enlarge needs a source image." });
@@ -1547,7 +1582,7 @@ async function enqueueStudioJob(req, res, { rewrite = null, action = "generate" 
   let height;
   if (initPath) {
     const original = await imageSize(initPath);
-    const sized = sizeForShortSide(original.width, original.height, ENLARGE_SHORT_SIDE);
+    const sized = sizeForLongSide(original.width, original.height, ENLARGE_LONG_SIDE);
     width = sized.width;
     height = sized.height;
   } else {

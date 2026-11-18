@@ -54,7 +54,7 @@ The right panel is always open. The rest of the window is the canvas: scroll to 
 
 **Canvas.** Drop or paste images onto the board to import them. Right-click one image for Copy, Download, or Enlarge. Right-click a multi-selection for Grid (animated masonry) or Delete. Delete removes the file from `generated/`.
 
-**Enlarge.** Lanczos-rescales the short side to 1024px, then runs Klein img2img at strength `0.3`. The new node sits beside the original at 2× canvas size.
+**Enlarge.** Lanczos-rescales the longer side to 1024px while keeping proportions, then runs Klein img2img at strength `1` with a fine texture reconstruction prompt. The new node sits beside the original at 2× canvas size and retains all subject and style metadata in `manifest.json`.
 
 ## Layout
 

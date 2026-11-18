@@ -257,8 +257,8 @@ const imageMenuEl = document.querySelector("#image-menu");
 const promptEditEl = document.querySelector("#prompt-edit");
 const promptEditForm = document.querySelector("#prompt-edit-form");
 const promptEditInput = document.querySelector("#prompt-edit-input");
-const ENLARGE_SHORT_SIDE = 1024;
-const ENLARGE_STRENGTH = 0.3;
+const ENLARGE_LONG_SIDE = 1024;
+const ENLARGE_STRENGTH = 1;
 
 function paintIcons(root = document) {
   window.lucide?.createIcons({
@@ -753,10 +753,10 @@ async function submitPromptEdit(event) {
   enqueuePreparedJob(job);
 }
 
-function sizeForShortSide(width, height, shortSide = ENLARGE_SHORT_SIDE) {
+function sizeForLongSide(width, height, longSide = ENLARGE_LONG_SIDE) {
   const w = Math.max(1, Number(width) || 1);
   const h = Math.max(1, Number(height) || 1);
-  const scale = shortSide / Math.min(w, h);
+  const scale = longSide / Math.max(w, h);
   const snap = (value) => Math.max(64, Math.round(value / 64) * 64);
   return { width: snap(w * scale), height: snap(h * scale) };
 }
@@ -799,7 +799,7 @@ function downloadCanvasImage(image) {
 
 function enlargeCanvasImage(image, nodeId) {
   const known = images.find((item) => item.filename === image.filename) ?? image;
-  const sized = sizeForShortSide(known.width, known.height);
+  const sized = sizeForLongSide(known.width, known.height);
   const parts = descriptionOf(known);
   const job = {
     id: `job-${++jobSeq}-${Date.now()}`,
