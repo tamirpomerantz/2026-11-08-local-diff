@@ -87,6 +87,16 @@
     <div id="ratio-menu" class="ratio-menu" hidden></div>
     <div id="sampler-menu" class="sampler-menu" hidden></div>
     <div id="image-menu" class="image-menu" hidden></div>
+    <dialog id="enlarge-dialog" class="enlarge-dialog" aria-labelledby="enlarge-prompt-label">
+      <form method="dialog">
+        <label id="enlarge-prompt-label" for="enlarge-prompt">Enlarge prompt</label>
+        <textarea id="enlarge-prompt" rows="6" required autofocus></textarea>
+        <div class="enlarge-dialog-actions">
+          <button value="cancel" formnovalidate>Cancel</button>
+          <button value="enlarge">Enlarge</button>
+        </div>
+      </form>
+    </dialog>
     <div id="prompt-edit" class="prompt-edit" hidden>
       <form id="prompt-edit-form">
         <input

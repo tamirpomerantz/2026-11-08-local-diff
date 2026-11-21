@@ -494,27 +494,12 @@ async function generateEnlargePrompt({ subject, style } = {}) {
 }
 
 async function resolveEnlargeDescription(job) {
-  if (job.initPath) {
-    const sourceBase = path.basename(job.initPath);
-    let subject = (await rememberedPart(sourceBase, "subject")).trim();
-    let style = (await rememberedPart(sourceBase, "style")).trim();
+  const sourceBase = path.basename(job.initPath);
+  const { subject, style } = await rememberedDescription(sourceBase);
+  if (subject && style) return { subject, style };
 
-    if (!subject || !style) {
-      job.send?.({ type: "status", message: `Describing image with fal (${FAL_DESCRIBE_MODEL})…` });
-      const desc = await ensureImageDescription(sourceBase, job.initPath, subject, style);
-      subject = desc.subject;
-      style = desc.style;
-    }
-    job.subject = subject;
-    job.style = style;
-    return { subject, style };
-  }
-
-  const expanded = expandPromptParts(job.subject, job.style);
-  return {
-    subject: expanded.subject ? expanded.subject.trim() : "",
-    style: expanded.style ? expanded.style.trim() : "",
-  };
+  job.send?.({ type: "status", message: `Describing image with fal (${FAL_DESCRIBE_MODEL})…` });
+  return ensureImageDescription(sourceBase, job.initPath, subject, style);
 }
 
 async function rewriteQueuedJob(job) {
@@ -688,18 +673,49 @@ async function ensureDirs() {
   await fs.mkdir(PREVIEW_DIR, { recursive: true });
 }
 
+function imageMetadata(entry) {
+  return {
+    filename: entry.filename,
+    subject: String(entry.subject ?? entry.description ?? ""),
+    style: String(entry.style ?? ""),
+    seed: entry.seed ?? null,
+    steps: entry.steps ?? null,
+    sampler: entry.sampler ?? null,
+    aspect: entry.aspect ?? null,
+    createdAt: entry.createdAt ?? null,
+    width: entry.width ?? null,
+    height: entry.height ?? null,
+    scale: Number(entry.scale) >= 2 ? 2 : 1,
+    strength: entry.strength ?? null,
+    model: entry.model ?? null,
+    source: entry.source ?? null,
+  };
+}
+
+function imageResponse(entry) {
+  return { ...imageMetadata(entry), url: `/generated/${encodeURIComponent(entry.filename)}` };
+}
+
 async function readManifest() {
   try {
     const raw = await fs.readFile(MANIFEST_PATH, "utf8");
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
+    if (!Array.isArray(parsed)) throw new Error("Image manifest must be an array.");
+    return parsed.map(imageMetadata);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
   }
 }
 
 async function writeManifest(entries) {
-  await fs.writeFile(MANIFEST_PATH, JSON.stringify(entries, null, 2));
+  const temporary = path.join(GENERATED_DIR, `.manifest-${randomUUID()}.tmp`);
+  try {
+    await fs.writeFile(temporary, JSON.stringify(entries.map(imageMetadata), null, 2) + "\n");
+    await fs.rename(temporary, MANIFEST_PATH);
+  } finally {
+    await fs.unlink(temporary).catch(() => {});
+  }
 }
 
 let manifestWrite = Promise.resolve();
@@ -707,6 +723,16 @@ function enqueueManifest(task) {
   const run = manifestWrite.then(task, task);
   manifestWrite = run.then(() => undefined, () => undefined);
   return run;
+}
+
+function saveImageMetadata(entry) {
+  return enqueueManifest(async () => {
+    const manifest = await readManifest();
+    const index = manifest.findIndex((item) => item.filename === entry.filename);
+    if (index < 0) manifest.push(entry);
+    else manifest[index] = entry;
+    await writeManifest(manifest);
+  });
 }
 
 function descriptionParts(entry) {
@@ -889,21 +915,31 @@ function expandPromptParts(subject, style) {
   };
 }
 
-async function rememberedPart(filename, part) {
+function inheritedDescription(filename, byFile) {
   let current = path.basename(String(filename ?? ""));
-  const task = part === "style" ? "style" : "subject";
-  if (!current) return "";
-  const manifest = await readManifest();
   const visited = new Set();
-  while (current && !visited.has(current)) {
+  let subject = "";
+  let style = "";
+  while (current && !visited.has(current) && (!subject || !style)) {
     visited.add(current);
-    const item = manifest.find((entry) => entry.filename === current);
+    const item = byFile.get(current);
     if (!item) break;
     const parts = descriptionParts(item);
-    if (parts[task]) return parts[task];
+    subject ||= parts.subject;
+    style ||= parts.style;
     current = item.source ? path.basename(item.source) : "";
   }
-  return "";
+  return { subject, style };
+}
+
+async function rememberedDescription(filename) {
+  const manifest = await readManifest();
+  return inheritedDescription(filename, new Map(manifest.map((entry) => [entry.filename, entry])));
+}
+
+async function rememberedPart(filename, part) {
+  const description = await rememberedDescription(filename);
+  return description[part === "style" ? "style" : "subject"];
 }
 
 async function rememberImageDescription(filename, { subject, style }) {
@@ -939,8 +975,9 @@ async function ensureImageDescription(filename, filePath, existingSubject = "", 
   const base = path.basename(String(filename || filePath || ""));
 
   if (base) {
-    if (!subject) subject = (await rememberedPart(base, "subject")).trim();
-    if (!style) style = (await rememberedPart(base, "style")).trim();
+    const stored = await rememberedDescription(base);
+    subject ||= stored.subject;
+    style ||= stored.style;
   }
 
   if (subject && style) {
@@ -1153,37 +1190,36 @@ code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode"
 raise SystemExit(code)
 `;
 
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
 function consumeITermImages(state, chunk, onPng) {
+  const marker = "\u001b]1337;";
+  const emit = (encoded) => {
+    const png = Buffer.from(encoded, "base64");
+    if (png.length > 32 && png.subarray(0, 8).equals(PNG_SIGNATURE)) onPng(png);
+  };
   state.buf += chunk.toString("latin1");
-  const marker = "\u001b]1337;File=";
   while (true) {
     const start = state.buf.indexOf(marker);
     if (start < 0) {
-      if (state.buf.length > 2_000_000) state.buf = state.buf.slice(-2000);
+      state.buf = state.buf.slice(-(marker.length - 1));
       return;
     }
-    const colon = state.buf.indexOf(":", start);
-    if (colon < 0) return;
-    const bel = state.buf.indexOf("\u0007", colon);
-    const st = state.buf.indexOf("\u001b\\", colon);
-    let end = -1;
-    let payloadEnd = -1;
-    if (bel >= 0 && (st < 0 || bel < st)) {
-      end = bel + 1;
-      payloadEnd = bel;
-    } else if (st >= 0) {
-      end = st + 2;
-      payloadEnd = st;
-    } else {
-      return;
-    }
-    const b64 = state.buf.slice(colon + 1, payloadEnd).replace(/\s/g, "");
-    state.buf = state.buf.slice(end);
-    try {
-      const png = Buffer.from(b64, "base64");
-      if (png.length > 32 && png[0] === 0x89) onPng(png);
-    } catch {
-      // Ignore a truncated protocol chunk.
+    state.buf = state.buf.slice(start);
+    const terminator = /\u0007|\u001b\\/.exec(state.buf);
+    if (!terminator) return;
+    const message = state.buf.slice(marker.length, terminator.index);
+    state.buf = state.buf.slice(terminator.index + terminator[0].length);
+    if (message.startsWith("File=")) {
+      const colon = message.indexOf(":");
+      if (colon >= 0) emit(message.slice(colon + 1));
+    } else if (message.startsWith("MultipartFile=")) {
+      state.parts = [];
+    } else if (message.startsWith("FilePart=") && state.parts) {
+      state.parts.push(message.slice("FilePart=".length));
+    } else if (message === "FileEnd" && state.parts) {
+      emit(state.parts.join(""));
+      state.parts = null;
     }
   }
 }
@@ -1191,8 +1227,7 @@ function consumeITermImages(state, chunk, onPng) {
 function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onProgress, signal, logDetails }) {
   const previewArgs = [
     ...args,
-    "--output",
-    outputPath,
+    // Draw Things disables live terminal previews when an output file is requested.
     "--terminal-image",
     "--terminal-image-protocol",
     "iterm2",
@@ -1223,8 +1258,10 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
       let stdout = "";
       let stderr = "";
       let frames = 0;
+      let lastFrame;
       let lastReportedStep = -1;
       let writing = Promise.resolve();
+      const pendingPreviewPath = `${previewPath}.tmp`;
       const onAbort = () => killChild(child);
       if (signal?.aborted) onAbort();
       else signal?.addEventListener("abort", onAbort, { once: true });
@@ -1241,10 +1278,14 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
           onProgress?.(progress);
         }
         consumeITermImages(iterm, chunk, (png) => {
+          lastFrame = png;
+          frames += 1;
           writing = writing.then(async () => {
-            frames += 1;
-            await fs.writeFile(previewPath, png);
+            await fs.writeFile(pendingPreviewPath, png);
+            await fs.rename(pendingPreviewPath, previewPath);
             onPreview?.();
+          }).catch((error) => {
+            console.warn(`[draw-things-cli] preview write failed: ${error.message}`);
           });
         });
       };
@@ -1256,34 +1297,29 @@ function generateWithLivePreview({ args, outputPath, previewPath, onPreview, onP
       child.on("error", reject);
       child.on("close", async (code) => {
         signal?.removeEventListener("abort", onAbort);
-        await writing.catch(() => {});
+        await writing;
+        await fs.unlink(pendingPreviewPath).catch(() => {});
         if (signal?.aborted) {
           reject(cancelledError());
           return;
         }
-        if (code === 0) {
-          const exists = await fs.access(outputPath).then(() => true).catch(() => false);
-          if (exists) {
-            const size = await imageSize(outputPath).catch(() => null);
-            console.log(`[draw-things-cli] completed successfully. Output wrote ${outputPath}${size ? ` (${size.width}x${size.height})` : ""}`);
+        if (code === 0 && lastFrame) {
+          try {
+            await fs.writeFile(outputPath, lastFrame);
+            console.log(`[draw-things-cli] saved final terminal image to ${outputPath}`);
             resolve({ stdout, stderr, frames });
-            return;
+          } catch (error) {
+            reject(error);
           }
-          if (frames > 0) {
-            await fs.copyFile(previewPath, outputPath);
-            console.log(`[draw-things-cli] completed with preview frame. Output wrote ${outputPath}`);
-            resolve({ stdout, stderr, frames });
-            return;
-          }
+          return;
         }
         console.error(`[draw-things-cli] exited with code ${code}`);
-        reject(Object.assign(new Error((stderr || stdout).trim() || `draw-things-cli exited ${code}`), { frames }));
+        reject(new Error((stderr || stdout).trim() || `draw-things-cli exited ${code}`));
       });
     });
 
   return runWithPty().catch(async (error) => {
     if (error.cancelled || signal?.aborted) throw error.cancelled ? error : cancelledError();
-    if (error.frames > 0) throw error;
     await runCommand("draw-things-cli", fallbackArgs, { signal });
     return { frames: 0, fallback: true };
   });
@@ -1470,20 +1506,13 @@ async function listImages() {
           height = SHORT_SIDE;
         }
       }
-      return {
+      return imageResponse({
+        ...meta,
         filename,
-        url: `/generated/${encodeURIComponent(filename)}`,
-        subject: meta.subject ?? "",
-        style: meta.style ?? "",
-        seed: meta.seed ?? null,
-        steps: meta.steps ?? null,
-        sampler: meta.sampler ?? null,
-        aspect: meta.aspect ?? null,
         createdAt: meta.createdAt ?? stats.mtime.toISOString(),
         width,
         height,
-        scale: Number(meta.scale) >= 2 ? 2 : 1,
-      };
+      });
     }),
   );
 
@@ -1542,14 +1571,11 @@ async function runKleinGenerate(job) {
   let enlargeStyle = "";
   let enlargeSubject = "";
   if (initPath) {
-    const sourceBase = path.basename(initPath);
-    enlargeStyle = (await rememberedPart(sourceBase, "style")).trim();
-    enlargeSubject = (await rememberedPart(sourceBase, "subject")).trim();
-    if (!enlargeSubject || !enlargeStyle) {
-      const desc = await ensureImageDescription(sourceBase, initPath, enlargeSubject, enlargeStyle);
-      enlargeSubject = desc.subject;
-      enlargeStyle = desc.style;
-    }
+    const description = job.enlargeDescription ?? (job.enlargePrompt
+      ? await rememberedDescription(path.basename(initPath))
+      : await resolveEnlargeDescription(job));
+    enlargeSubject = description.subject;
+    enlargeStyle = description.style;
   } else {
     enlargeSubject = expanded.subject ? expanded.subject.trim() : "";
     enlargeStyle = expanded.style ? expanded.style.trim() : "";
@@ -1579,10 +1605,12 @@ async function runKleinGenerate(job) {
   busy = true;
   setKleinState({ loaded: true, action: "load", percent: 4, message: "Draw Things" });
   await fs.writeFile(promptPath, prompt);
+  let previewRevision = 0;
+  const sendPreview = () => send({ type: "preview", url: `/preview/${previewName}?frame=${++previewRevision}` });
   if (initPath) {
     await lanczosResize(initPath, initResizedPath, width, height);
     await fs.copyFile(initResizedPath, previewPath);
-    send({ type: "preview", url: `/preview/${previewName}?t=${Date.now()}` });
+    sendPreview();
     send({ type: "progress", step: 0, total: steps });
   }
   try {
@@ -1624,9 +1652,7 @@ async function runKleinGenerate(job) {
         seed,
         output: outputPath,
       },
-      onPreview: () => {
-        send({ type: "preview", url: `/preview/${previewName}?t=${Date.now()}` });
-      },
+      onPreview: sendPreview,
       onProgress: ({ step, total }) => {
         const percent = Math.max(4, Math.round((step / total) * 100));
         setKleinState({ loaded: true, action: "load", percent, message: "Draw Things" });
@@ -1660,9 +1686,7 @@ async function runKleinGenerate(job) {
       model: MODEL,
       source: initPath ? path.basename(initPath) : source ? path.basename(String(source)) : null,
     };
-    const manifest = await readManifest();
-    manifest.push(entry);
-    await writeManifest(manifest);
+    await saveImageMetadata(entry);
     setKleinState({ loaded: true, action: "idle", percent: 100, message: "Draw Things" });
     console.log(`[klein generate] wrote ${filename} ${width}x${height}`);
     // If this is a normal generate (non-enlarge) with no description, describe it in the background.
@@ -1673,7 +1697,7 @@ async function runKleinGenerate(job) {
     }
     send({
       type: "done",
-      image: { ...entry, url: `/generated/${encodeURIComponent(filename)}` },
+      image: imageResponse(entry),
     });
     job.res.end();
   } finally {
@@ -1710,6 +1734,7 @@ const jobQueue = createJobQueue({
         if (job.initPath) {
           job.send({ type: "status", message: `Customizing upscale prompt with ${TEXT_MODEL_ID}…` });
           const desc = await resolveEnlargeDescription(job);
+          job.enlargeDescription = desc;
           job.enlargePrompt = await generateEnlargePrompt(desc);
           if (job.cancelled) continue;
         }
@@ -1748,20 +1773,20 @@ async function enqueueStudioJob(req, res, { rewrite = null, action = "generate" 
     res.status(400).json({ error: "Unknown rewrite action." });
     return;
   }
-  let subject = String(req.body?.subject ?? rewrite?.subject ?? "").trim();
-  let style = String(req.body?.style ?? rewrite?.style ?? "").trim();
+  const subject = String(req.body?.subject ?? rewrite?.subject ?? "").trim();
+  const style = String(req.body?.style ?? rewrite?.style ?? "").trim();
   const mode = String(req.body?.mode ?? "");
   const initPath = mode === "enlarge" ? resolveExistingFile(req.body?.image) : null;
-  if (initPath) {
-    const sourceBase = path.basename(initPath);
-    subject = (await rememberedPart(sourceBase, "subject")).trim();
-    style = (await rememberedPart(sourceBase, "style")).trim();
-  }
   let aspect = String(req.body?.aspect ?? "1:1");
   if (initPath && (!req.body?.aspect || req.body.aspect === "1:1")) {
     const manifest = await readManifest();
     const sourceMeta = manifest.find((item) => item.filename === path.basename(initPath));
     if (sourceMeta?.aspect) aspect = sourceMeta.aspect;
+  }
+  const enlargePrompt = initPath ? req.body?.enlargePrompt : undefined;
+  if (enlargePrompt !== undefined && (typeof enlargePrompt !== "string" || !enlargePrompt.trim())) {
+    res.status(400).json({ error: "Enter an enlargement prompt." });
+    return;
   }
   const ratio = findRatio(aspect);
   if (mode === "enlarge" && !initPath) {
@@ -1808,7 +1833,8 @@ async function enqueueStudioJob(req, res, { rewrite = null, action = "generate" 
     id: String(req.body?.id || randomUUID()),
     clientId: String(req.body?.id || ""),
     action: rewriteAction || (initPath ? "enlarge" : action),
-    stage: rewriteAction || initPath ? "rewrite" : "generate",
+    stage: rewriteAction || (initPath && !enlargePrompt) ? "rewrite" : "generate",
+    enlargePrompt,
     rewrite: rewriteAction
       ? {
           action: rewriteAction,
@@ -1976,8 +2002,10 @@ app.delete("/api/images/:filename", async (req, res) => {
   }
   try {
     const filename = path.basename(filePath);
-    const manifest = (await readManifest()).filter((entry) => entry.filename !== filename);
-    await writeManifest(manifest);
+    await enqueueManifest(async () => {
+      const manifest = (await readManifest()).filter((entry) => entry.filename !== filename);
+      await writeManifest(manifest);
+    });
     const canvas = await readCanvas();
     if (canvas.positions[filename]) {
       delete canvas.positions[filename];
@@ -2064,16 +2092,9 @@ app.post("/api/import", async (req, res) => {
     const filePath = path.join(GENERATED_DIR, unique);
     await fs.writeFile(filePath, Buffer.from(base64, "base64"));
     const size = await imageSize(filePath);
-    res.json({
-      image: {
-        filename: unique,
-        url: `/generated/${encodeURIComponent(unique)}`,
-        subject: "",
-        style: "",
-        createdAt: new Date().toISOString(),
-        ...size,
-      },
-    });
+    const entry = { filename: unique, createdAt: new Date().toISOString(), ...size };
+    await saveImageMetadata(entry);
+    res.json({ image: imageResponse(entry) });
   } catch (error) {
     res.status(500).json({ error: publicError(error) });
   }
@@ -2249,7 +2270,20 @@ function queueLibraryRefresh(filename) {
   }, 150);
 }
 
+async function migrateImageManifest() {
+  await enqueueManifest(async () => {
+    const manifest = new Map((await readManifest()).map((entry) => [entry.filename, entry]));
+    for (const image of await listImages()) manifest.set(image.filename, image);
+    const entries = [...manifest.values()].map((entry) => ({
+      ...entry,
+      ...inheritedDescription(entry.filename, manifest),
+    }));
+    await writeManifest(entries);
+  });
+}
+
 await ensureDirs();
+await migrateImageManifest();
 const generatedWatch = watch(GENERATED_DIR, (eventType, filename) => {
   queueLibraryRefresh(filename);
 });
@@ -2274,63 +2308,7 @@ const server = app.listen(PORT, () => {
   console.log(`fal describe: ${FAL_DESCRIBE_MODEL}`);
   console.log(`Watching ${GENERATED_DIR}`);
   refreshKleinAvailability().catch(() => {});
-  // Backfill descriptions for all existing images that are missing subject or style.
-  backfillDescriptions().catch((err) => {
-    console.warn(`[klein backfill] error: ${err.message || err}`);
-  });
 });
-
-async function backfillDescriptions() {
-  // Give the server a moment to fully start before hitting fal.
-  await new Promise((r) => setTimeout(r, 3000));
-  let names;
-  try {
-    names = (await fs.readdir(GENERATED_DIR)).filter(
-      (name) => !name.startsWith(".") && IMAGE_EXTS.has(path.extname(name).toLowerCase()),
-    );
-  } catch {
-    return;
-  }
-  const manifest = await readManifest();
-  const byFile = new Map(manifest.map((e) => [e.filename, e]));
-  let count = 0;
-  for (const filename of names) {
-    const meta = byFile.get(filename) ?? {};
-    const existing = descriptionParts(meta);
-    // First try chain-walking manifest (source → source → …) for inherited descriptions.
-    let subject = existing.subject || (await rememberedPart(filename, "subject"));
-    let style = existing.style || (await rememberedPart(filename, "style"));
-    if (subject && style) {
-      // Persist if we inherited something that wasn't saved directly on this entry.
-      if (!existing.subject || !existing.style) {
-        await rememberImageDescription(filename, { subject, style });
-        console.log(`[klein backfill] inherited description for ${filename}`);
-        count++;
-      }
-      continue;
-    }
-    // Still missing something — call fal to describe the actual image file.
-    const filePath = path.join(GENERATED_DIR, filename);
-    try {
-      await fs.access(filePath);
-    } catch {
-      continue; // File doesn't exist on disk, skip.
-    }
-    try {
-      const desc = await ensureImageDescription(filename, filePath, subject, style);
-      if (desc.subject || desc.style) {
-        console.log(`[klein backfill] described ${filename} via fal`);
-        count++;
-      }
-    } catch (err) {
-      console.warn(`[klein backfill] fal failed for ${filename}: ${err.message || err}`);
-    }
-    // Throttle: 1 image per 2 seconds so we don't hammer fal during active use.
-    await new Promise((r) => setTimeout(r, 2000));
-  }
-  if (count > 0) console.log(`[klein backfill] done — updated ${count} image(s)`);
-  else console.log(`[klein backfill] all images already have descriptions`);
-}
 
 function endSseClients(clients) {
   for (const res of clients) {

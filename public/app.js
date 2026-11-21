@@ -259,6 +259,10 @@ const promptEditForm = document.querySelector("#prompt-edit-form");
 const promptEditInput = document.querySelector("#prompt-edit-input");
 const ENLARGE_LONG_SIDE = 1024;
 const ENLARGE_STRENGTH = 1;
+const enlargeDialog = document.querySelector("#enlarge-dialog");
+const enlargePromptInput = document.querySelector("#enlarge-prompt");
+const DEFAULT_CUSTOM_ENLARGE_PROMPT =
+  "Preserve the exact materials, composition, shapes, colors and lighting. Reconstruct natural fine surface details, subtle material texture, realistic micro-texture and organic imperfections.";
 
 function paintIcons(root = document) {
   window.lucide?.createIcons({
@@ -797,7 +801,7 @@ function downloadCanvasImage(image) {
   link.remove();
 }
 
-function enlargeCanvasImage(image, nodeId) {
+function enlargeCanvasImage(image, nodeId, enlargePrompt) {
   const known = images.find((item) => item.filename === image.filename) ?? image;
   const sized = sizeForLongSide(known.width, known.height);
   const parts = descriptionOf(known);
@@ -817,6 +821,7 @@ function enlargeCanvasImage(image, nodeId) {
     source: known.filename,
     image: known.filename,
     strength: ENLARGE_STRENGTH,
+    enlargePrompt,
     mode: "enlarge",
     beside: nodeId || known.filename,
   };
@@ -846,6 +851,53 @@ function enlargeCanvasImage(image, nodeId) {
   pumpGenerateQueue();
 }
 
+function openEnlargeDialog(image, nodeId) {
+  enlargePromptInput.value = DEFAULT_CUSTOM_ENLARGE_PROMPT;
+  enlargePromptInput.setCustomValidity("");
+  enlargeDialog.showModal();
+  enlargeDialog.querySelector("form").onsubmit = (event) => {
+    if (event.submitter?.value === "cancel") return;
+    event.preventDefault();
+    const prompt = enlargePromptInput.value;
+    if (!prompt.trim()) {
+      enlargePromptInput.setCustomValidity("Enter an enlargement prompt.");
+      enlargePromptInput.reportValidity();
+      return;
+    }
+    enlargeDialog.close();
+    enlargeCanvasImage(image, nodeId, prompt);
+  };
+}
+
+enlargePromptInput.addEventListener("input", () => enlargePromptInput.setCustomValidity(""));
+
+function appendEnlargeMenu(button, { image, nodeId, x, y }) {
+  const child = document.createElement("div");
+  child.className = "image-menu-child";
+  child.hidden = true;
+  button.setAttribute("aria-expanded", "false");
+  button.append(lucideIcon("chevron-down"));
+  button.addEventListener("click", () => {
+    child.hidden = !child.hidden;
+    button.setAttribute("aria-expanded", String(!child.hidden));
+    placeOnScreen(imageMenuEl, x, y);
+  });
+  for (const [label, select] of [
+    ["Auto", () => enlargeCanvasImage(image, nodeId)],
+    ["Customize…", () => openEnlargeDialog(image, nodeId)],
+  ]) {
+    const option = document.createElement("button");
+    option.type = "button";
+    option.textContent = label;
+    option.addEventListener("click", () => {
+      closeImageMenu();
+      select();
+    });
+    child.append(option);
+  }
+  imageMenuEl.append(button, child);
+}
+
 function openImageMenu(detail) {
   const multi = detail?.mode === "multi" && Array.isArray(detail.nodeIds) && detail.nodeIds.length > 1;
   const image = detail?.image;
@@ -872,13 +924,16 @@ function openImageMenu(detail) {
     const button = document.createElement("button");
     button.type = "button";
     button.append(lucideIcon(action.icon), document.createTextNode(action.label));
+    if (action.id === "enlarge") {
+      appendEnlargeMenu(button, detail);
+      continue;
+    }
     button.addEventListener("click", async (event) => {
       event.stopPropagation();
       closeImageMenu();
       try {
         if (action.id === "copy") await copyCanvasImage(image);
         else if (action.id === "download") downloadCanvasImage(image);
-        else if (action.id === "enlarge") enlargeCanvasImage(image, detail.nodeId);
         else if (action.id === "closeup") {
           await rewriteCanvasPrompt(image, detail.nodeId, {
             action: "closeup",
@@ -1690,6 +1745,7 @@ async function runGenerateJob(job) {
               mode: "enlarge",
               image: job.image,
               strength: job.strength,
+              enlargePrompt: job.enlargePrompt,
             }
           : {}),
       }),
@@ -1699,9 +1755,6 @@ async function runGenerateJob(job) {
     if (response.status === 409) {
       await new Promise((resolve) => setTimeout(resolve, 400));
       if (job.cancelled) return "cancelled";
-      job.started = false;
-      generateQueue.unshift(job);
-      startQueuedJobs();
       return false;
     }
     if (!response.ok) {
@@ -1780,17 +1833,14 @@ async function runGenerateJob(job) {
   }
 }
 
+// Leave room for image requests alongside the two persistent watch streams.
+const MAX_GENERATION_STREAMS = 3;
 let inflightJobs = 0;
 let queueFailed = 0;
 
 function finishQueueIfIdle() {
   if (inflightJobs > 0) return;
-  const leftover = generateQueue.filter((job) => !job.cancelled);
-  if (leftover.some((job) => !job.started)) {
-    startQueuedJobs();
-    return;
-  }
-  if (leftover.length) return;
+  if (generateQueue.some((job) => !job.cancelled)) return;
   generateQueue = [];
   queueRunning = false;
   const failed = queueFailed;
@@ -1810,7 +1860,9 @@ function finishQueueIfIdle() {
 }
 
 function startQueuedJobs() {
-  const pending = generateQueue.filter((job) => !job.started && !job.cancelled);
+  const pending = generateQueue
+    .filter((job) => !job.started && !job.cancelled)
+    .slice(0, MAX_GENERATION_STREAMS - inflightJobs);
   if (!pending.length) {
     finishQueueIfIdle();
     return;
@@ -1824,6 +1876,7 @@ function startQueuedJobs() {
     runGenerateJob(job)
       .then((result) => {
         if (result === true) queueDone += 1;
+        if (result === false) job.started = false;
       })
       .catch((error) => {
         queueFailed += 1;
@@ -1839,8 +1892,10 @@ function startQueuedJobs() {
       })
       .finally(() => {
         inflightJobs = Math.max(0, inflightJobs - 1);
-        generateQueue = generateQueue.filter((item) => item.id !== job.id);
-        finishQueueIfIdle();
+        if (job.started || job.cancelled) {
+          generateQueue = generateQueue.filter((item) => item.id !== job.id);
+        }
+        startQueuedJobs();
       });
   }
 }

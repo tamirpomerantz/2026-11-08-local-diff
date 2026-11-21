@@ -25,7 +25,6 @@ export function ImageNode({ id, data, selected }) {
         ) : null}
         {generating && (
           <div className="canvas-image-generating-overlay">
-            {hasImage && <div className="canvas-image-generating-shimmer" />}
             <div className="canvas-image-generating-badge">
               <span className="canvas-image-generating-spinner" />
               <span>
