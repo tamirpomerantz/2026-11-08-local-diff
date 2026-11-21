@@ -250,9 +250,8 @@ const generateBtn = document.querySelector("#generate-btn");
 const statusEl = document.querySelector("#status");
 const errorEl = document.querySelector("#error");
 const statusPill = document.querySelector("#status-pill");
-const slotsEl = document.querySelector("#slots");
+const ratioSelect = document.querySelector("#image-ratio");
 const stripPlayEl = document.querySelector("#strip-play");
-const ratioMenuEl = document.querySelector("#ratio-menu");
 const imageMenuEl = document.querySelector("#image-menu");
 const promptEditEl = document.querySelector("#prompt-edit");
 const promptEditForm = document.querySelector("#prompt-edit-form");
@@ -525,43 +524,13 @@ async function finishGeneratedSlot(slot, generated) {
   }
 }
 
-function cycleAspect(slot) {
-  if (!isPending(slot)) return;
-  const ids = config.ratios.map((ratio) => ratio.id);
-  const index = Math.max(0, ids.indexOf(slot.aspect));
-  slot.aspect = ids[(index + 1) % ids.length];
-  slot.image = null;
-  slot.status = "idle";
-  slot.error = "";
-  renderSlots();
-}
-
 function setSlotAspect(slot, aspect) {
   if (!isPending(slot)) return;
   slot.aspect = ratioFor(aspect).id;
   slot.image = null;
   slot.status = "idle";
   slot.error = "";
-  closeRatioMenu();
   renderSlots();
-}
-
-function aspectIconStyle(aspect) {
-  const parts = String(aspect).split(":");
-  const w = Number(parts[0]) || 1;
-  const h = Number(parts[1]) || 1;
-  const maxDim = Math.max(w, h);
-  return `width:${Math.round((w / maxDim) * 20)}px;height:${Math.round((h / maxDim) * 20)}px`;
-}
-
-let ratioMenuAnchor = null;
-
-function closeRatioMenu() {
-  ratioMenuEl.hidden = true;
-  ratioMenuEl.replaceChildren();
-  ratioMenuEl.style.maxHeight = "";
-  ratioMenuEl.style.overflowY = "";
-  ratioMenuAnchor = null;
 }
 
 function closeImageMenu() {
@@ -633,7 +602,6 @@ function closePromptEdit() {
 function openPromptEdit(detail) {
   const image = images.find((item) => item.filename === detail?.image?.filename) ?? detail?.image;
   if (!image?.url) return;
-  closeRatioMenu();
   closeSamplerMenu();
   closeImageMenu();
   promptEditTarget = { image, nodeId: detail.nodeId || image.filename };
@@ -902,7 +870,6 @@ function openImageMenu(detail) {
   const multi = detail?.mode === "multi" && Array.isArray(detail.nodeIds) && detail.nodeIds.length > 1;
   const image = detail?.image;
   if (!multi && !image?.url) return;
-  closeRatioMenu();
   closeSamplerMenu();
   closePromptEdit();
   imageMenuEl.replaceChildren();
@@ -1009,29 +976,6 @@ function placeOnScreen(el, x, y, margin = 8) {
   }
 }
 
-function openRatioMenu(event, slot) {
-  if (!isPending(slot)) return;
-  event.preventDefault();
-  event.stopPropagation();
-  ratioMenuEl.replaceChildren();
-  for (const ratio of config.ratios) {
-    const option = document.createElement("button");
-    option.type = "button";
-    option.setAttribute("aria-current", ratio.id === slot.aspect ? "true" : "false");
-    option.innerHTML = `<span>${ratio.id}</span><span class="ratio-icon" style="${aspectIconStyle(ratio.id)}"></span>`;
-    option.addEventListener("click", (clickEvent) => {
-      clickEvent.stopPropagation();
-      setSlotAspect(slot, ratio.id);
-    });
-    ratioMenuEl.append(option);
-  }
-  closeSamplerMenu();
-  ratioMenuEl.hidden = false;
-  ratioMenuAnchor = { x: event.clientX, y: event.clientY };
-  placeOnScreen(ratioMenuEl, ratioMenuAnchor.x, ratioMenuAnchor.y);
-  boardPeek?.latch();
-}
-
 function closeSamplerMenu() {
   samplerMenuEl.hidden = true;
   samplerMenuEl.replaceChildren();
@@ -1041,7 +985,6 @@ function closeSamplerMenu() {
 }
 
 function openSamplerMenu() {
-  closeRatioMenu();
   if (!samplerMenuEl.hidden) {
     closeSamplerMenu();
     return;
@@ -1074,39 +1017,11 @@ function selectImage(image, { restore = false } = {}) {
   updateActionButtons();
 }
 
-function renderSlotCard(slot) {
-  const parts = String(slot.aspect || "1:1").split(":");
-  const card = document.createElement("article");
-  card.className = "slot";
-  const ratio = `${Number(parts[0]) || 1} / ${Number(parts[1]) || 1}`;
-  card.style.aspectRatio = ratio;
-
-  const frame = document.createElement("div");
-  frame.className = `frame ${slot.status === "error" ? "error" : "idle"}`;
-  frame.style.aspectRatio = ratio;
-  frame.setAttribute("aria-label", slot.aspect);
-  frame.title = `${slot.aspect} · click to cycle · right-click for menu`;
-
-  frame.addEventListener("click", (event) => {
-    if (event.button !== 0) return;
-    cycleAspect(slot);
-  });
-  frame.addEventListener("contextmenu", (event) => openRatioMenu(event, slot));
-
-  const label = document.createElement("span");
-  label.className = "aspect-label";
-  label.textContent = slot.aspect;
-  frame.append(label);
-
-  card.append(frame);
-  return card;
-}
-
 function renderSlots() {
   generateBtn.disabled = false;
-  slotsEl.replaceChildren();
   const slot = slots[0];
-  if (slot) slotsEl.append(renderSlotCard(slot));
+  ratioSelect.disabled = !slot || !isPending(slot);
+  if (slot) ratioSelect.value = slot.aspect;
 }
 
 let imagesFetchSeq = 0;
@@ -2073,7 +1988,6 @@ samplerBtn.addEventListener("click", (event) => {
   openSamplerMenu();
 });
 document.addEventListener("click", (event) => {
-  if (!ratioMenuEl.hidden && !ratioMenuEl.contains(event.target)) closeRatioMenu();
   if (!imageMenuEl.hidden && !imageMenuEl.contains(event.target)) closeImageMenu();
   if (!promptEditEl.hidden && !promptEditEl.contains(event.target) && !promptEditEl.dataset.busy) {
     closePromptEdit();
@@ -2088,7 +2002,6 @@ document.addEventListener("click", (event) => {
 });
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
-    closeRatioMenu();
     closeSamplerMenu();
     closeImageMenu();
     closePromptEdit();
@@ -2107,9 +2020,6 @@ document.addEventListener("contextmenu", (event) => {
   closeImageMenu();
 });
 window.addEventListener("resize", () => {
-  if (!ratioMenuEl.hidden && ratioMenuAnchor) {
-    placeOnScreen(ratioMenuEl, ratioMenuAnchor.x, ratioMenuAnchor.y);
-  }
   if (!samplerMenuEl.hidden) {
     const rect = samplerBtn.getBoundingClientRect();
     placeOnScreen(samplerMenuEl, rect.right, rect.bottom + 4);
@@ -2305,7 +2215,7 @@ const boardPeek = attachEdgePeek({
     busy ||
     isDescribing() ||
     promptEls.includes(document.activeElement) ||
-    !ratioMenuEl.hidden ||
+    document.activeElement === ratioSelect ||
     !samplerMenuEl.hidden ||
     !imageMenuEl.hidden ||
     !promptEditEl.hidden,
@@ -2319,6 +2229,8 @@ for (const el of promptEls) {
 config = await fetch("/api/config").then((response) => response.json());
 if (config.model) models.klein.id = config.model;
 setSampler(config.defaultSampler);
+for (const { id } of config.ratios) ratioSelect.add(new Option(id, id));
+ratioSelect.addEventListener("change", () => setSlotAspect(slots[0], ratioSelect.value));
 addSlot("1:1");
 renderDescribe();
 await checkHealth();

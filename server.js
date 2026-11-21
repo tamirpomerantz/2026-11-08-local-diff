@@ -405,7 +405,8 @@ async function imageToFalDataUrl(filePath) {
 }
 
 function logModelCall(source, model, action) {
-  console.log(`[model] ${source} ${model} · ${action}`);
+  const line = `[model] ${source} ${model} · ${action}`;
+  console.log(source === "local" ? line : `\x1b[31m${line}\x1b[0m`);
 }
 
 const REWRITE_ACTIONS = {

@@ -59,7 +59,10 @@
       </div>
 
       <section class="strip">
-        <div id="slots" class="slots"></div>
+        <div class="ratio-control">
+          <label for="image-ratio">Image ratio</label>
+          <select id="image-ratio" disabled></select>
+        </div>
         <button type="button" id="sampler-btn" class="sampler-btn" aria-haspopup="listbox" aria-expanded="false">
           <span id="sampler-label">DDIM Trailing</span>
           <i data-lucide="chevron-down"></i>
@@ -84,7 +87,6 @@
       </div>
     </aside>
 
-    <div id="ratio-menu" class="ratio-menu" hidden></div>
     <div id="sampler-menu" class="sampler-menu" hidden></div>
     <div id="image-menu" class="image-menu" hidden></div>
     <dialog id="enlarge-dialog" class="enlarge-dialog" aria-labelledby="enlarge-prompt-label">
